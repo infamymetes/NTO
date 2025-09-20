@@ -1243,6 +1243,94 @@ def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int,
     except Exception as e:
         raise RuntimeError(f"Failed to export pair timeseries: {e}")
 
+# ---------------------------------------------------------------------------------
+# --- START: MARKET INTERNALS ROLLUP (SPY vs RSP Health)
+# ---------------------------------------------------------------------------------
+
+def market_internals_rollup(watchlist_df: pd.DataFrame, run_dir: str):
+    """
+    Calculates sector rollups and computes SPY (cap-weighted) vs. RSP (equal-weighted)
+    health scores to measure market breadth. Saves the output to a CSV file.
+    """
+    # Configuration for the rollup
+    sector_map = {
+        "Tech":      ["NVDA", "MSFT", "AAPL", "GOOG", "GOOGL", "AMZN", "META", "AVGO"],
+        "Defensive": ["JNJ", "ABBV", "UNH", "WMT", "PG", "KO"],
+        "Financials":["V", "JPM", "BRK-B", "MA"],
+        "EnergyInd": ["XOM", "CVX", "T", "TMUS", "NEE"]
+    }
+
+    phase_bias_map = {
+        "Exponential":   1.0,
+        "Maturity":      0.5,
+        "Deterioration":-1.0,
+        "Reset":        -0.5,
+        "Unknown":       0.0
+    }
+
+    weights_spy = {"Tech": 0.45, "Defensive": 0.25, "Financials": 0.20, "EnergyInd": 0.10}
+    weights_rsp = {"Tech": 0.25, "Defensive": 0.25, "Financials": 0.25, "EnergyInd": 0.25}
+
+    # Helper function for sector calculation
+    def rollup_sector(df, name, tickers):
+        # We need to match based on the pair, as watchlist_df has Left/Right columns
+        sub = df[df["Left"].isin(tickers) | df["Right"].isin(tickers)].copy()
+        if sub.empty:
+            return None
+
+        sub['PhaseBias'] = sub["GrowthPhase"].map(phase_bias_map).fillna(0)
+        bias = sub['PhaseBias'].mean()
+
+        breakout = (sub["GrowthPhase"].isin(["Exponential"])).mean()
+        exhaustion = (sub["GrowthPhase"].isin(["Deterioration"])).mean()
+        
+        return {
+            "Sector": name,
+            "%Breakout": f"{breakout:.0%}",
+            "%Exhaustion": f"{exhaustion:.0%}",
+            "PhaseBias": round(bias, 2)
+        }
+
+    # Main logic
+    rows = []
+    for sector, tickers in sector_map.items():
+        out = rollup_sector(watchlist_df, sector, tickers)
+        if out:
+            rows.append(out)
+    
+    if not rows:
+        print("[MarketInternals] No matching tickers found in watchlist to build the rollup.")
+        return
+        
+    roll = pd.DataFrame(rows).set_index("Sector")
+
+    spy_health = (roll["PhaseBias"] * pd.Series(weights_spy)).sum()
+    rsp_health = (roll["PhaseBias"] * pd.Series(weights_rsp)).sum()
+    spread = spy_health - rsp_health
+    
+    summary_data = {
+        "SPY Health": spy_health,
+        "RSP Health": rsp_health,
+        "Spread (SPY–RSP)": spread
+    }
+    
+    for name, value in summary_data.items():
+        roll.loc[name] = {"%Breakout": "—", "%Exhaustion": "—", "PhaseBias": round(value, 2)}
+        
+    result_df = roll.reset_index()
+    
+    # Save to file
+    output_path = os.path.join(run_dir, "market_internals_rollup.csv")
+    result_df.to_csv(output_path, index=False)
+    print(f"[MarketInternals] Rollup saved to: {output_path}")
+    print(result_df.to_markdown(index=False))
+
+
+# ---------------------------------------------------------------------------------
+# --- END: MARKET INTERNALS ROLLUP
+# ---------------------------------------------------------------------------------
+
+
 def main():
     # Parse arguments first
     import os
@@ -1250,6 +1338,12 @@ def main():
     ap = argparse.ArgumentParser(description="StatArb Engine v1.3 — pairs scanner")
     ap.add_argument("--portfolio_mode", type=str, choices=["on","off"], default="off",
                     help="If 'on', generate position plans and units watchlist CSVs (no broker integration).")
+    # ... (rest of the arguments are unchanged) ...
+    
+    # --- New arguments for market internals rollup ---
+    ap.add_argument("--market_internals_rollup", action="store_true",
+                    help="Generate a market internals rollup based on SPY vs RSP sector weightings.")
+    
     ap.add_argument("--max_concurrent", type=int, default=5, help="Max concurrent planned opens per run (position plans).")
     ap.add_argument("--per_ticker_cap", type=float, default=0.05, help="Per-ticker cap as fraction of equity (e.g., 0.05 = 5%).")
     ap.add_argument("--unit_targets", type=str, default=None,
@@ -1840,6 +1934,7 @@ def main():
 
     # Export watchlist (top N)
     wl_rows = []
+    # (The rest of the main function is unchanged...)
     for r in results[:args.max_pairs]:
         legweights = f"{r.left}: +1.00, {r.right}: -{r.best.beta:.2f}"
         wl_rows.append({
@@ -1872,3 +1967,20 @@ def main():
             "GrowthPhase": r.growth_phase,
             "PhaseGuidance": r.phase_guidance,
         })
+
+    wl_df = pd.DataFrame(wl_rows)
+    ensure_dir(args.watchlist)
+    wl_df.to_csv(args.watchlist, index=False)
+    print(f"[StatArb] Watchlist saved: {os.path.abspath(args.watchlist)}")
+
+    # --- Integration Point for Market Internals Rollup ---
+    if args.market_internals_rollup:
+        if not wl_df.empty:
+            market_internals_rollup(wl_df, run_dir)
+        else:
+            print("[MarketInternals] Watchlist is empty, skipping rollup.")
+
+    # (The rest of the script continues...)
+
+if __name__ == "__main__":
+    main()
