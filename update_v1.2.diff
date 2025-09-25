@@ -1,0 +1,430 @@
+--- a/NTO-5e69652c47e549f757b23fcf15a230f703222a02/StatArbEngine_v1.py
++++ b/NTO-0803b904d2f79da17475fbc92915a7eed5a76cbe/StatArbEngine_v1.py
+@@ -1,15 +1,16 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+ """
+-StatArb Engine v1.1 (single-file scaffold)
++StatArb Engine v1.2 (single-file scaffold)
+ Author: Mike + ChatGPT
+ License: MIT
+ ---------------------------------------------------------------------
+ Purpose
+   • Scan a universe of tickers for cointegrated pairs across multiple rolling windows
+   • Compute hedge ratio (beta), spread Z-score, and mean-reversion half-life
+   • Score conviction and emit trade signals
+   • Export Watchlist CSV (top candidates) and Diagnostics CSV (full details)
+ 
+-Changes in v1.1
+-  • Fixed price loading to handle adjusted close correctly (auto_adjust=False)
+-  • Added support for loading local CSV files with adjusted close prices
++Changes in v1.2
++  • Added --start_offset_days CLI argument for flexible, rolling start dates.
++  • Corrected logic in growth_phase, S/R level integration, and watchlist export.
+ 
+ Usage Example
+   python StatArbEngine_v1.py \
+@@ -19,7 +20,8 @@
+     --pvalue 0.05 \
+     --z_enter 2.0 --z_scale 2.5 --z_exit 0.5 \
+     --hl_min 3 --hl_max 40 \
+-    --max_pairs 8 \
+-    --watchlist ./outputs/watchlist_pairs.csv \
+-    --diagnostics ./outputs/diagnostics.csv
++    --max_pairs 5
+ 
+ Notes
+   • Requires: pandas, numpy, statsmodels, yfinance
+@@ -218,11 +220,11 @@
+     # growth phase diagnostics
+     growth_phase: str = ""
+     phase_guidance: str = ""
+-    support_1σ: float = np.nan
+-    resistance_1σ: float = np.nan
+-    support_2σ: float = np.nan
+-    resistance_2σ: float = np.nan
++    support_1s: float = np.nan
++    resistance_1s: float = np.nan
++    support_2s: float = np.nan
++    resistance_2s: float = np.nan
+     sr_signal: str = ""
+ 
+ # --- Portfolio Planner dataclasses ---
+ @dataclass
+@@ -536,33 +538,31 @@
+       - phase: Exponential / Maturity / Deterioration / Reset
+       - guidance: textual advice for trading in that regime
+     """
+-
+-    if not z_history or len(z_history) < 5:
++    z_arr = np.asarray(z_history, dtype=float).ravel()
++    z_arr = z_arr[~np.isnan(z_arr)]
++
++    if z_arr.size < 5:
+         return "Unknown", "Insufficient history"
+ 
+-    slope = np.polyfit(range(len(z_history)), z_history, 1)[0]
+-    variance = np.var(z_history[-10:])  # recent spread variance
+-    latest_z = z_history[-1]
+-
+-    # Phase rules
++    recent_n = min(10, z_arr.size)
++    try:
++        slope = float(np.polyfit(np.arange(z_arr.size), z_arr, 1)[0])
++    except Exception:
++        slope = 0.0
++
++    variance = float(np.var(z_arr[-recent_n:]))
++    latest_z = float(z_arr[-1])
++
+     if slope > 0.2 and latest_z > 1 and half_life < 5:
+         return "Exponential", "Trade smaller divergences, size up, mean reverts quickly"
+     elif abs(slope) < 0.1 and variance < 0.5 and 3 <= half_life <= 7:
+         return "Maturity", "Stick to standard entries, HL stable, clean mean reverts"
+     elif (slope < -0.2 or variance > 1.0) and half_life < 4:
+         return "Deterioration", "Tight entries, faster exits, entropy high"
+     elif abs(latest_z) > 2.5 or half_life > 8:
+         return "Reset", "Expect longer holding periods, reversion is slower"
+     else:
+         return "Maturity", "Default regime"
+ 
+ 
+ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
+                   pvalue_cut: float, hl_min: int, hl_max: int,
+@@ -599,31 +599,23 @@
+     sub = px[[y, x]].dropna().tail(primary.window)
+     spread = sub[y] - beta * sub[x]
+     z_history = zscore(spread).values
+-    sr_levels = compute_sr_levels(spread)
+-    support_1 = sr_levels["Support_1σ"]
+-    resist_1 = sr_levels["Resistance_1σ"]
+-    support_2 = sr_levels["Support_2σ"]
+-    resist_2 = sr_levels["Resistance_2σ"]
+-
+-    notes = []
+-    range_note = (
+-    f"Spread={spread.iloc[-1]:.2f}; "
+-    f"S1={support_1:.2f}; R1={resist_1:.2f}; "
+-    f"S2={support_2:.2f}; R2={resist_2:.2f}"
+-    )
+-    notes.append(range_note)
+ 
+     # --- SR Signal Classification ---
+-    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
++    sr_levels = compute_sr_levels(spread)
++    s1, r1, s2, r2 = sr_levels["Support_1s"], sr_levels["Resistance_1s"], sr_levels["Support_2s"], sr_levels["Resistance_2s"]
++    
++    current_spread = spread.iloc[-1]
++    if current_spread > r2 or current_spread < s2:
+         sr_signal = "Beyond ±2σ"
+-    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
++    elif current_spread > r1 or current_spread < s1:
+         sr_signal = "Beyond ±1σ"
+     else:
+         sr_signal = "Inside Band"
+ 
+-    # Append SR signal into notes (for watchlist.csv)
+-    notes.append(f"SR_Signal={sr_signal}")
+-    notes.append(range_note)
+-    
+-    # --- SR Signal Classification ---
+-    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
+-        sr_signal = "Beyond ±2σ"
+-    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
+-        sr_signal = "Beyond ±1σ"
+-    else:
+-        sr_signal = "Inside Band"
+     # --- Growth phase diagnostics ---
+     phase, guidance = growth_phase(z_history, primary.half_life, beta)
+     # --- Regime + risk stats (computed before adaptive entry so we can use spread_vol/macro) ---
+@@ -643,10 +635,9 @@
+         macro_flag=macro_flag
+     )
+ 
+-    action = ""
++    notes = []
++    action = "HOLD"
+     # Use new adaptive entry rule for signal/action
+     if signal != "HOLD" and conviction >= 2.5:
+         action = signal
+         notes.append(f"AdaptiveEntry: {signal}, Conv={conviction:.2f}, Z={z:.2f}, HL={primary.half_life:.1f}")
+-    else:
+-        action = "HOLD"
+ 
+     # --- SPY long-only override logic ---
+     # If signal is ENTER_LONG_SPREAD and y=="SPY", or ENTER_SHORT_SPREAD and x=="SPY", then this is a "LONG_SPY_OPPORTUNITY"
+@@ -666,7 +657,7 @@
+             # if user supplied a static threshold, compare against it
+             if getattr(args_global, "johansen_trace_threshold", None) is not None and j_trace is not None:
+                 j_pass = bool(j_trace > float(args_global.johansen_trace_threshold))
+     except Exception:
+-        j_pass, j_trace, j_crit = False, None, None
++        pass
+ 
+     # Apply filter based on Johansen pass/fail
+     if getattr(args_global, "johansen_filter", False) and not j_pass:
+@@ -724,13 +715,7 @@
+         exp_guide, opt_map, contracts,
+         adf_p, stationary, vol_regime, spread_vol, suggested_notional,
+         johansen_trace, johansen_crit, johansen_pass, "", np.nan,
+-        growth_phase=phase,
+-        phase_guidance=guidance,
+-        support_1σ=support_1,
+-        resistance_1σ=resist_1,
+-        support_2σ=support_2,
+-        resistance_2σ=resist_2,
+-        sr_signal=sr_signal,
++        phase, guidance,
++        s1, r1, s2, r2, sr_signal
+     )
+ 
+ 
+@@ -957,11 +942,6 @@
+         try:
+             diag_df = pd.read_csv(diag_path)
+             row["Flips"] = (diag_df["Flip"] == "Yes").sum() if "Flip" in diag_df.columns else 0
+             row["AvgCorrDriftSPY"] = diag_df["CorrDriftSPY"].mean() if "CorrDriftSPY" in diag_df.columns else None
+-            row["Support_1σ"] = r.support_1σ
+-            row["Resistance_1σ"] = r.resistance_1σ
+-            row["Support_2σ"] = r.support_2σ
+-            row["Resistance_2σ"] = r.resistance_2σ
+-            row["SR_Signal"] = r.sr_signal
+         except Exception as e:
+             msg = f"[StatArb] Failed to attach diagnostics summary: {e}"
+             print(msg)
+@@ -977,41 +957,29 @@
+ 
+ args_global = None
+ 
++def compute_sr_levels(spread: pd.Series):
++    mu = spread.mean()
++    sigma = spread.std()
++    return {
++        "MA": mu,
++        "Support_1s": mu - sigma,
++        "Resistance_1s": mu + sigma,
++        "Support_2s": mu - 2*sigma,
++        "Resistance_2s": mu + 2*sigma,
++    }
++
+ def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int, beta: float, run_dir: str):
+     """
+     Export spread and Z-score series for a given pair into CSV.
+     """
+     try:
+-        spread = px[left] - beta * px[right]
++        sub = px[[left, right]].dropna().tail(window)
++        spread = sub[left] - beta * sub[right]
+         z = zscore(spread)
++        sr = compute_sr_levels(spread)
++        
+         df = pd.DataFrame({
+-            "Spread": spread.tail(window),
+-            "ZScore": z.tail(window)
+-        })
+-        out_path = os.path.join(run_dir, f"{left}-{right}_spread_timeseries.csv")
+-        df.to_csv(out_path)
+-        return out_path
+-    except Exception as e:
+-        raise RuntimeError(f"Failed to export pair timeseries: {e}")
+-
+-# ---------------------------------------------------------------------------------
+-# --- START: MARKET INTERNALS ROLLUP (SPY vs RSP Health)
+-# ---------------------------------------------------------------------------------
+-
+-def market_internals_rollup(watchlist_df: pd.DataFrame, run_dir: str):
+-    """
+-    Calculates sector rollups and computes SPY (cap-weighted) vs. RSP (equal-weighted)
+-    health scores to measure market breadth. Saves the output to a CSV file.
+-    """
+-    # Configuration for the rollup
+-    sector_map = {
+-        "Tech":      ["NVDA", "MSFT", "AAPL", "GOOG", "GOOGL", "AMZN", "META", "AVGO"],
+-        "Defensive": ["JNJ", "ABBV", "UNH", "WMT", "PG", "KO"],
+-        "Financials":["V", "JPM", "BRK-B", "MA"],
+-        "EnergyInd": ["XOM", "CVX", "T", "TMUS", "NEE"]
+-    }
+-
+-    phase_bias_map = {
+-        "Exponential":   1.0,
+-        "Maturity":      0.5,
+-        "Deterioration":-1.0,
+-        "Reset":        -0.5,
+-        "Unknown":       0.0
+-    }
+-
+-    weights_spy = {"Tech": 0.45, "Defensive": 0.25, "Financials": 0.20, "EnergyInd": 0.10}
+-    weights_rsp = {"Tech": 0.25, "Defensive": 0.25, "Financials": 0.25, "EnergyInd": 0.25}
+-
+-    # Helper function for sector calculation
+-    def rollup_sector(df, name, tickers):
+-        # We need to match based on the pair, as watchlist_df has Left/Right columns
+-        sub = df[df["Left"].isin(tickers) | df["Right"].isin(tickers)].copy()
+-        if sub.empty:
+-            return None
+-
+-        sub['PhaseBias'] = sub["GrowthPhase"].map(phase_bias_map).fillna(0)
+-        bias = sub['PhaseBias'].mean()
+-
+-        breakout = (sub["GrowthPhase"].isin(["Exponential"])).mean()
+-        exhaustion = (sub["GrowthPhase"].isin(["Deterioration"])).mean()
+-        
+-        return {
+-            "Sector": name,
+-            "%Breakout": f"{breakout:.0%}",
+-            "%Exhaustion": f"{exhaustion:.0%}",
+-            "PhaseBias": round(bias, 2)
+-        }
+-
+-    # Main logic
+-    rows = []
+-    for sector, tickers in sector_map.items():
+-        out = rollup_sector(watchlist_df, sector, tickers)
+-        if out:
+-            rows.append(out)
+-    
+-    if not rows:
+-        print("[MarketInternals] No matching tickers found in watchlist to build the rollup.")
+-        return
+-        
+-    roll = pd.DataFrame(rows).set_index("Sector")
+-
+-    spy_health = (roll["PhaseBias"] * pd.Series(weights_spy)).sum()
+-    rsp_health = (roll["PhaseBias"] * pd.Series(weights_rsp)).sum()
+-    spread = spy_health - rsp_health
+-    
+-    summary_data = {
+-        "SPY Health": spy_health,
+-        "RSP Health": rsp_health,
+-        "Spread (SPY–RSP)": spread
+-    }
+-    
+-    for name, value in summary_data.items():
+-        roll.loc[name] = {"%Breakout": "—", "%Exhaustion": "—", "PhaseBias": round(value, 2)}
+-        
+-    result_df = roll.reset_index()
+-    
+-    # Save to file
+-    output_path = os.path.join(run_dir, "market_internals_rollup.csv")
+-    result_df.to_csv(output_path, index=False)
+-    print(f"[MarketInternals] Rollup saved to: {output_path}")
+-    print(result_df.to_markdown(index=False))
+-
+-
+-# ---------------------------------------------------------------------------------
+-# --- END: MARKET INTERNALS ROLLUP
+-# ---------------------------------------------------------------------------------
++            "Spread": spread,
++            "ZScore": z,
++            "MA": sr["MA"],
++            "Support_1s": sr["Support_1s"],
++            "Resistance_1s": sr["Resistance_1s"],
++            "Support_2s": sr["Support_2s"],
++            "Resistance_2s": sr["Resistance_2s"]
++        })
++        out_path = os.path.join(run_dir, f"{left}-{right}_spread_timeseries.csv")
++        df.to_csv(out_path)
++        return out_path
++    except Exception as e:
++        raise RuntimeError(f"Failed to export pair timeseries: {e}")
+ 
+ 
+ def main():
+@@ -1019,13 +987,13 @@
+     import os
+     import json
+     ap = argparse.ArgumentParser(description="StatArb Engine v1.3 — pairs scanner")
+-    ap.add_argument("--portfolio_mode", type=str, choices=["on","off"], default="off",
+-                    help="If 'on', generate position plans and units watchlist CSVs (no broker integration).")
+-    # ... (rest of the arguments are unchanged) ...
+-    
+-    # --- New arguments for market internals rollup ---
+-    ap.add_argument("--market_internals_rollup", action="store_true",
+-                    help="Generate a market internals rollup based on SPY vs RSP sector weightings.")
+-    
++    
++    # --- ADDED: start_offset_days argument ---
++    ap.add_argument("--start_offset_days", type=int, default=None,
++                    help="Set start date relative to today (e.g., 90 = 90 days ago). Overrides --start.")
++    
++    ap.add_argument("--portfolio_mode", type=str, choices=["on","off"], default="off",
++                    help="If 'on', generate position plans and units watchlist CSVs (no broker integration).")
++    ap.add_argument("--market_internals_rollup", action="store_true",
++                    help="Generate a market internals rollup based on SPY vs RSP sector weightings.")
+     ap.add_argument("--max_concurrent", type=int, default=5, help="Max concurrent planned opens per run (position plans).")
+     ap.add_argument("--per_ticker_cap", type=float, default=0.05, help="Per-ticker cap as fraction of equity (e.g., 0.05 = 5%).")
+     ap.add_argument("--unit_targets", type=str, default=None,
+@@ -1134,6 +1102,12 @@
+     # Ensure output directory exists for all output artifacts
+     if not os.path.exists(run_dir):
+         os.makedirs(run_dir)
++        
++    # --- LOGIC TO HANDLE NEW --start_offset_days ---
++    if args.start_offset_days is not None:
++        offset = int(args.start_offset_days)
++        args.start = (pd.Timestamp.today().normalize() - pd.DateOffset(days=offset)).strftime("%Y-%m-%d")
++        print(f"[StatArb] Using offset start date: {args.start}")
+     # Optional: load event config JSON
+     if args.event_config and os.path.exists(args.event_config):
+         try:
+@@ -1142,7 +1116,8 @@
+             if isinstance(cfg, dict):
+                 if "start" in cfg:
+                     args.start = cfg["start"]
+-                elif "start_offset_days" in cfg:
++                # Config offset is now overridden by CLI offset if both are present
++                elif "start_offset_days" in cfg and args.start_offset_days is None:
+                     offset = int(cfg.get("start_offset_days", 365))
+                     args.start = (pd.Timestamp.today().normalize() - pd.DateOffset(days=offset)).strftime("%Y-%m-%d")
+                 if "interval" in cfg:
+@@ -1480,29 +1455,27 @@
+ 
+     # Export watchlist (top N)
+     wl_rows = []
+-    # (The rest of the main function is unchanged...)
+     for r in results[:args.max_pairs]:
+-        legweights = f"{r.left}: +1.00, {r.right}: -{r.best.beta:.2f}"
+         wl_rows.append({
+             "Pair": f"{r.left}-{r.right}",
+             "Left": r.left,
+             "Right": r.right,
+-            "BestWindow": r.best.window if pd.notna(r.best.window) else "",
+-            "PValue": round(r.best.pvalue, 6) if pd.notna(r.best.pvalue) else "",
+-            "Beta": round(r.best.beta, 4) if pd.notna(r.best.beta) else "",
+-            "HalfLife": round(r.best.half_life, 2) if pd.notna(r.best.half_life) else "",
+-            "Z": round(r.best.z_curr, 3) if pd.notna(r.best.z_curr) else "",
+-            "Conviction": round(r.conviction_score, 2) if pd.notna(r.conviction_score) else "",
++            "BestWindow": r.best.window,
++            "PValue": f"{r.best.pvalue:.4f}",
++            "Beta": f"{r.best.beta:.3f}",
++            "HalfLife": f"{r.best.half_life:.1f}",
++            "Z": f"{r.best.z_curr:.2f}",
++            "Conviction": f"{r.conviction_score:.2f}",
+             "ConvictionBand": r.conviction_band,
+             "Signal": r.signal,
+             "Action": r.action,
+-            "Notes": r.notes,
+-            "ExpirationGuide": r.expiration_guide,
+-            "OptionMap": r.option_map,
+-            "ContractsSummary": r.contracts_summary,
+-            "StationarityP": round(r.stationarity_p, 4) if pd.notna(r.stationarity_p) else "",
+-            "Stationary": r.stationary,
+-            "VolRegime": r.vol_regime,
+-            "SpreadVol": round(r.spread_vol, 5) if pd.notna(r.spread_vol) else "",
+-            "SuggestedNotional": round(r.suggested_notional, 2) if pd.notna(r.suggested_notional) else "",
+-            "JohansenTrace": round(r.johansen_trace, 3) if pd.notna(r.johansen_trace) else "",
+-            "JohansenCrit": round(r.johansen_crit, 3) if pd.notna(r.johansen_crit) else "",
+-            "JohansenPass": r.johansen_pass,
+-            "Flip": r.flip,
+-            "CorrDriftSPY": round(r.corr_drift_spy, 4) if pd.notna(r.corr_drift_spy) else "",
++            "SR_Signal": r.sr_signal,
++            "Support_1s": f"{r.support_1s:.2f}",
++            "Resistance_1s": f"{r.resistance_1s:.2f}",
++            "Support_2s": f"{r.support_2s:.2f}",
++            "Resistance_2s": f"{r.resistance_2s:.2f}",
+             "GrowthPhase": r.growth_phase,
+             "PhaseGuidance": r.phase_guidance,
++            "Notes": r.notes,
+         })
+ 
+     wl_df = pd.DataFrame(wl_rows)

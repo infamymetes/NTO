@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-StatArb Engine v1.1 (single-file scaffold)
+StatArb Engine v1.2 (single-file scaffold)
 Author: Mike + ChatGPT
 License: MIT
 ---------------------------------------------------------------------
@@ -11,27 +11,15 @@ Purpose
   • Score conviction and emit trade signals
   • Export Watchlist CSV (top candidates) and Diagnostics CSV (full details)
 
-Changes in v1.1
-  • Fixed price loading to handle adjusted close correctly (auto_adjust=False)
-  • Added support for loading local CSV files with adjusted close prices
+Changes in v1.2
+  • Added --start_offset_days CLI argument for flexible, rolling start dates.
+  • Corrected logic in growth_phase, S/R level integration, and watchlist export.
 
 Usage Example
   python StatArbEngine_v1.py \
-    --universe SPY QQQ RSP DIA XLK XLF XLE XLV XLY XLU IWM \
-    --start 2021-01-01 \
-    --interval 1d \
-    --windows 30 60 90 180 252 \
-    --pvalue 0.05 \
-    --z_enter 2.0 --z_scale 2.5 --z_exit 0.5 \
-    --hl_min 3 --hl_max 40 \
-    --max_pairs 8 \
-    --watchlist ./outputs/watchlist_pairs.csv \
-    --diagnostics ./outputs/diagnostics.csv
-
-Notes
-  • Requires: pandas, numpy, statsmodels, yfinance
-  • Internet access is required at runtime to fetch prices via yfinance unless using --local_dir
-  • For intraday, set --interval 5m and adjust windows to bar counts
+    --universe SPY QQQ RSP --start_offset_days 90 \
+    --interval 1d --windows 30 60 \
+    --max_pairs 5
 ---------------------------------------------------------------------
 """
 import numpy as np
@@ -1332,14 +1320,15 @@ def main():
     import os
     import json
     ap = argparse.ArgumentParser(description="StatArb Engine v1.3 — pairs scanner")
+    
+    # --- ADDED: start_offset_days argument ---
+    ap.add_argument("--start_offset_days", type=int, default=None,
+                    help="Set start date relative to today (e.g., 90 = 90 days ago). Overrides --start.")
+    
     ap.add_argument("--portfolio_mode", type=str, choices=["on","off"], default="off",
                     help="If 'on', generate position plans and units watchlist CSVs (no broker integration).")
-    # ... (rest of the arguments are unchanged) ...
-    
-    # --- New arguments for market internals rollup ---
     ap.add_argument("--market_internals_rollup", action="store_true",
                     help="Generate a market internals rollup based on SPY vs RSP sector weightings.")
-    
     ap.add_argument("--max_concurrent", type=int, default=5, help="Max concurrent planned opens per run (position plans).")
     ap.add_argument("--per_ticker_cap", type=float, default=0.05, help="Per-ticker cap as fraction of equity (e.g., 0.05 = 5%).")
     ap.add_argument("--unit_targets", type=str, default=None,
@@ -1456,6 +1445,13 @@ def main():
     # Ensure output directory exists for all output artifacts
     if not os.path.exists(run_dir):
         os.makedirs(run_dir)
+        
+    # --- LOGIC TO HANDLE NEW --start_offset_days ---
+    if args.start_offset_days is not None:
+        offset = int(args.start_offset_days)
+        args.start = (pd.Timestamp.today().normalize() - pd.DateOffset(days=offset)).strftime("%Y-%m-%d")
+        print(f"[StatArb] Using offset start date: {args.start}")
+
     # Optional: load event config JSON
     if args.event_config and os.path.exists(args.event_config):
         try:
@@ -1464,7 +1460,8 @@ def main():
             if isinstance(cfg, dict):
                 if "start" in cfg:
                     args.start = cfg["start"]
-                elif "start_offset_days" in cfg:
+                # Config offset is now overridden by CLI offset if both are present
+                elif "start_offset_days" in cfg and args.start_offset_days is None:
                     offset = int(cfg.get("start_offset_days", 365))
                     args.start = (pd.Timestamp.today().normalize() - pd.DateOffset(days=offset)).strftime("%Y-%m-%d")
                 if "interval" in cfg:
@@ -1970,3 +1967,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
