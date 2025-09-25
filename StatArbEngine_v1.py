@@ -1927,6 +1927,7 @@ def main():
 
     # Export watchlist (top N)
     wl_rows = []
+    # (The rest of the main function is unchanged...)
     for r in results[:args.max_pairs]:
         wl_rows.append({
             "Pair": f"{r.left}-{r.right}",
@@ -1963,9 +1964,51 @@ def main():
         else:
             print("[MarketInternals] Watchlist is empty, skipping rollup.")
 
-    # (The rest of the script continues...)
+# Export diagnostics (all results)
+    diags_rows = []
+    for r in results:
+        diags_rows.append({
+            "Pair": f"{r.left}-{r.right}",
+            "Left": r.left,
+            "Right": r.right,
+            "BestWindow": r.best.window,
+            "PValue": r.best.pvalue,
+            "Beta": r.best.beta,
+            "HalfLife": r.best.half_life,
+            "Z": r.best.z_curr,
+            "Conviction": r.conviction_score,
+            "ConvictionBand": r.conviction_band,
+            "Signal": r.signal,
+            "Action": r.action,
+            "SR_Signal": r.sr_signal,
+            "Support_1s": r.support_1s,
+            "Resistance_1s": r.resistance_1s,
+            "Support_2s": r.support_2s,
+            "Resistance_2s": r.resistance_2s,
+            "GrowthPhase": r.growth_phase,
+            "PhaseGuidance": r.phase_guidance,
+            "Notes": r.notes,
+            "StationarityP": r.stationarity_p,
+            "Stationary": r.stationary,
+            "VolRegime": r.vol_regime,
+            "SpreadVol": r.spread_vol,
+            "SuggestedNotional": r.suggested_notional,
+            "JohansenTrace": r.johansen_trace,
+            "JohansenCrit": r.johansen_crit,
+            "JohansenPass": r.johansen_pass
+        })
 
+    diags_df = pd.DataFrame(diags_rows)
+    ensure_dir(args.diagnostics)
+    diags_df.to_csv(args.diagnostics, index=False)
+    print(f"[StatArb] Diagnostics saved: {os.path.abspath(args.diagnostics)}")
+
+    # --- Final Logging and Metrics Update ---
+    log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=tripped)
+
+    if args.account_equity:
+        log_pnl(run_dir, results, args.account_equity)
+        update_equity_curve(run_dir)
+        update_performance_metrics(run_dir)
 if __name__ == "__main__":
     main()
-
-    
