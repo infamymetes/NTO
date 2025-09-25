@@ -1376,9 +1376,13 @@ def market_internals_rollup(watchlist_df: pd.DataFrame, run_dir: str):
 
 
 def main():
+    print("--- SCRIPT STARTED ---") # <--- ADD THIS LINE
+
     # Parse arguments first
     import os
     import json
+    import pandas as pd
+
     ap = argparse.ArgumentParser(description="StatArb Engine v1.3 — pairs scanner")
     ap.add_argument("--debug_universe", action="store_true",
                     help="Print debug information about universe construction and filtering.")
@@ -1886,6 +1890,11 @@ def main():
         # Already loaded px from px_snapshot.csv
         print(f"[StatArb] Universe: {list(px.columns)}; Rows: {len(px)}")
 
+    # ADD THESE THREE LINES BELOW
+    print(f"--- DEBUG: Price data shape: {px.shape if 'px' in locals() and px is not None else 'Not loaded'}")
+    if 'px' in locals() and px is not None and not px.empty:
+        print(f"--- DEBUG: Price data loaded successfully. Columns: {px.columns.tolist()}")
+
     # Override output paths to point into run_dir (output directory)
     args.output = run_dir  # Add output attribute for clarity
     args.watchlist = os.path.join(args.output, "watchlist.csv")
@@ -1984,6 +1993,8 @@ def main():
                            args.account_equity, args.risk_unit)
         if pr is not None:
             results.append(pr)
+
+    print(f"--- DEBUG: Finished evaluating {len(list(itertools.combinations(list(px.columns), 2)))} pairs. Found {len(results)} qualifying pairs. ---") # <--- ADD THIS LINE
 
     if not results:
         msg = "[StatArb] No qualifying pairs found with current settings."
@@ -2212,17 +2223,6 @@ def main():
         log_pnl(run_dir, results, args.account_equity)
         update_equity_curve(run_dir)
         update_performance_metrics(run_dir)
-
-    if 'results_sorted' in locals() and args.rank_by:
-        key_map = {
-            "conviction": lambda r: getattr(r, "conviction_score", 0),
-            "half_life": lambda r: getattr(r, "best", None) and getattr(r.best, "half_life", 0) or 0,
-            "johansen": lambda r: getattr(r, "johansen_strength", 0),
-            "expectancy": lambda r: getattr(r, "expectancy", 0),
-        }
-    if args.rank_by in key_map:
-            results_sorted = sorted(results_sorted, key=key_map[args.rank_by], reverse=True)
-            print(f"[StatArb] Results ranked by {args.rank_by}")
 
 if __name__ == "__main__":
     main()

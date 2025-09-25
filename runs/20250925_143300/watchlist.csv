@@ -1,2 +1,0 @@
-Pair,Left,Right,BestWindow,PValue,Beta,HalfLife,Z,Conviction,ConvictionBand,Signal,Action,SR_Signal,Support_1s,Resistance_1s,Support_2s,Resistance_2s,GrowthPhase,PhaseGuidance,Notes
-IWM-SPY,IWM,SPY,48,0.0368,0.593,4.7,-0.60,3.25,Low,HOLD,HOLD,Inside Band,-150.98,-148.91,-152.01,-147.88,Maturity,"Stick to standard entries, HL stable, clean mean reverts",β=0.593; HL=4.7; Z=-0.60; p=0.0368; W=48

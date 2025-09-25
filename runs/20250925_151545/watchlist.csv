@@ -1,2 +1,0 @@
-Pair,Left,Right,BestWindow,PValue,Beta,HalfLife,Z,Conviction,ConvictionBand,Signal,Action,SR_Signal,SR_Deviation,JohansenStrength,NL_Description,Notes
-QQQ-SPY,QQQ,SPY,60,0.0787,1.048,4.7,0.65,2.21,Low,HOLD,HOLD,Inside Band,0.649,-6.143,"QQQ-SPY spread is inside its ±1s band, HL=4.7d, in a maturity regime, with weak Johansen evidence. Conviction: Low.",β=1.048; HL=4.7; Z=0.65; p=0.0787; W=60
