@@ -2213,16 +2213,16 @@ def main():
         update_equity_curve(run_dir)
         update_performance_metrics(run_dir)
 
-if 'results_sorted' in locals() and args.rank_by:
-    key_map = {
-        "conviction": lambda r: getattr(r, "conviction_score", 0),
-        "half_life": lambda r: getattr(r, "best", None) and getattr(r.best, "half_life", 0) or 0,
-        "johansen": lambda r: getattr(r, "johansen_strength", 0),
-        "expectancy": lambda r: getattr(r, "expectancy", 0),
-    }
-if args.rank_by in key_map:
-        results_sorted = sorted(results_sorted, key=key_map[args.rank_by], reverse=True)
-        print(f"[StatArb] Results ranked by {args.rank_by}")
+    if 'results_sorted' in locals() and args.rank_by:
+        key_map = {
+            "conviction": lambda r: getattr(r, "conviction_score", 0),
+            "half_life": lambda r: getattr(r, "best", None) and getattr(r.best, "half_life", 0) or 0,
+            "johansen": lambda r: getattr(r, "johansen_strength", 0),
+            "expectancy": lambda r: getattr(r, "expectancy", 0),
+        }
+    if args.rank_by in key_map:
+            results_sorted = sorted(results_sorted, key=key_map[args.rank_by], reverse=True)
+            print(f"[StatArb] Results ranked by {args.rank_by}")
 
 if __name__ == "__main__":
     main()
