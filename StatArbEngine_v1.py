@@ -281,11 +281,13 @@ class PairResult:
     # growth phase diagnostics
     growth_phase: str = ""
     phase_guidance: str = ""
-    support_1σ: float = np.nan
-    resistance_1σ: float = np.nan
-    support_2σ: float = np.nan
-    resistance_2σ: float = np.nan
+    # S/R levels
+    support_1s: float = np.nan
+    resistance_1s: float = np.nan
+    support_2s: float = np.nan
+    resistance_2s: float = np.nan
     sr_signal: str = ""
+
 
 # --- Portfolio Planner dataclasses ---
 @dataclass
@@ -778,28 +780,20 @@ def growth_phase(z_history: list[float], half_life: float, beta: float) -> tuple
     """
     Classify the regime of a pair into one of four growth-cycle phases.
     Inputs:
-      - z_history: rolling Z-score history (list/np.array/Series)
+      - z_history: rolling Z-score history
       - half_life: estimated reversion horizon
       - beta: sensitivity of spread
     Outputs:
       - phase: Exponential / Maturity / Deterioration / Reset
       - guidance: textual advice for trading in that regime
     """
-
-    # Normalize to 1-D numpy array and drop NaNs
-    try:
-        z_arr = np.asarray(z_history, dtype=float).ravel()
-    except Exception:
-        return "Unknown", "Invalid z-history"
-
+    z_arr = np.asarray(z_history, dtype=float).ravel()
     z_arr = z_arr[~np.isnan(z_arr)]
+
     if z_arr.size < 5:
         return "Unknown", "Insufficient history"
 
-    # Guard against degenerate recent slice length
     recent_n = min(10, z_arr.size)
-
-    # Compute slope via polyfit with basic error guard
     try:
         slope = float(np.polyfit(np.arange(z_arr.size), z_arr, 1)[0])
     except Exception:
@@ -808,7 +802,6 @@ def growth_phase(z_history: list[float], half_life: float, beta: float) -> tuple
     variance = float(np.var(z_arr[-recent_n:]))
     latest_z = float(z_arr[-1])
 
-    # Phase rules
     if slope > 0.2 and latest_z > 1 and half_life < 5:
         return "Exponential", "Trade smaller divergences, size up, mean reverts quickly"
     elif abs(slope) < 0.1 and variance < 0.5 and 3 <= half_life <= 7:
@@ -836,7 +829,6 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
             pv = engle_granger_pvalue(sub[y], sub[x])
             if pv >= pvalue_cut:
                 continue
-            # Select beta estimator based on CLI mode
             beta = ols_beta(sub[y], sub[x]) if getattr(args_global, "beta_mode", "ols") == "ols" else rls_kalman_beta(sub[y], sub[x])
             if pd.isna(beta):
                 return None
@@ -858,169 +850,97 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
 
     z = primary.z_curr
     beta = primary.beta
-    # --- Z-derivatives and regime stats (regime computed before adaptive entry) ---
-    # Maintain z_history for the window
     sub = px[[y, x]].dropna().tail(primary.window)
     spread = sub[y] - beta * sub[x]
     z_history = zscore(spread).values
+
     sr_levels = compute_sr_levels(spread)
-    support_1 = sr_levels["Support_1σ"]
-    resist_1 = sr_levels["Resistance_1σ"]
-    support_2 = sr_levels["Support_2σ"]
-    resist_2 = sr_levels["Resistance_2σ"]
-
-    notes = []
-    range_note = (
-    f"Spread={spread.iloc[-1]:.2f}; "
-    f"S1={support_1:.2f}; R1={resist_1:.2f}; "
-    f"S2={support_2:.2f}; R2={resist_2:.2f}"
-    )
-    notes.append(range_note)
-
-    # --- SR Signal Classification ---
-    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
-        sr_signal = "Beyond ±2σ"
-    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
-        sr_signal = "Beyond ±1σ"
-    else:
-        sr_signal = "Inside Band"
-
-    # Append SR signal into notes (for watchlist.csv)
-    notes.append(f"SR_Signal={sr_signal}")
-    notes.append(range_note)
+    s1, r1, s2, r2 = sr_levels["Support_1s"], sr_levels["Resistance_1s"], sr_levels["Support_2s"], sr_levels["Resistance_2s"]
     
-    # --- SR Signal Classification ---
-    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
-        sr_signal = "Beyond ±2σ"
-    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
-        sr_signal = "Beyond ±1σ"
+    current_spread = spread.iloc[-1]
+    if current_spread > r2 or current_spread < s2:
+        sr_signal = "Beyond ±2s"
+    elif current_spread > r1 or current_spread < s1:
+        sr_signal = "Beyond ±1s"
     else:
         sr_signal = "Inside Band"
-    # --- Growth phase diagnostics ---
+
     phase, guidance = growth_phase(z_history, primary.half_life, beta)
-    # --- Regime + risk stats (computed before adaptive entry so we can use spread_vol/macro) ---
     adf_p, stationary, vol_regime, spread_vol = regime_flags(spread)
     macro_flag = (vol_regime or "Normal").lower()
-    # Compute Z derivatives
     dz = np.gradient(z_history)[-1] if len(z_history) > 1 else 0.0
     ddz = np.gradient(np.gradient(z_history))[-1] if len(z_history) > 2 else 0.0
-    # For now, stub pvbe_band and dvte_score if not integrated
-    pvbe_band = "inside"
-    dvte_score = 0.0
-
-    signal, conviction = adaptive_entry_rule(
-        zscore=z,
-        spread_vol=spread_vol,
-        dz=dz,
-        ddz=ddz,
-        pvbe_band=pvbe_band,
-        dvte_liquidity=dvte_score,
-        macro_flag=macro_flag
-    )
-
-    action = ""
-    # Use new adaptive entry rule for signal/action
+    
+    pvbe_band, dvte_score = "inside", 0.0
+    signal, conviction = adaptive_entry_rule(z, spread_vol, dz, ddz, pvbe_band, dvte_score, macro_flag)
+    
+    notes = []
+    action = "HOLD"
     if signal != "HOLD" and conviction >= 2.5:
         action = signal
-        notes.append(f"AdaptiveEntry: {signal}, Conv={conviction:.2f}, Z={z:.2f}, HL={primary.half_life:.1f}")
-    else:
-        action = "HOLD"
+        notes.append(f"AdaptiveEntry: Conv={conviction:.2f}")
 
-    # --- SPY long-only override logic ---
-    # If signal is ENTER_LONG_SPREAD and y=="SPY", or ENTER_SHORT_SPREAD and x=="SPY", then this is a "LONG_SPY_OPPORTUNITY"
-    # (Keep for compatibility: if adaptive rule triggers, map appropriately)
     if (signal == "ENTER_LONG" and y.upper() == "SPY") or (signal == "ENTER_SHORT" and x.upper() == "SPY"):
         signal = "LONG_SPY_OPPORTUNITY"
 
     cv_score, cv_band = conviction_score(primary, secondary, z_scale, hl_min, hl_max)
 
-# Johansen bonus/filter integration (dynamic, sample-size–aware)
-# Compute once on the best window; allow static threshold to override crit if provided
-    j_pass, j_trace, j_crit = False, None, None
+    j_pass, j_trace, j_crit = False, np.nan, np.nan
     try:
         sub_for_j = px[[y, x]].dropna().tail(primary.window)
         if len(sub_for_j) >= 60:
             j_pass, j_trace, j_crit = johansen_passes(sub_for_j, conf=0.95)
-            # Optional override: if user supplied a static threshold, compare against it
             if getattr(args_global, "johansen_trace_threshold", None) is not None and j_trace is not None:
                 j_pass = bool(j_trace > float(args_global.johansen_trace_threshold))
     except Exception:
-        j_pass, j_trace, j_crit = False, None, None
+        pass
 
-    # Apply filter based on Johansen pass/fail
     if getattr(args_global, "johansen_filter", False) and not j_pass:
         return None
 
-    # Prepare a scaled Johansen bonus based on gap (trace - crit), capped at +2.0
     pending_j_bonus = 0.0
-    if getattr(args_global, "johansen_bonus", False) and (j_trace is not None) and (j_crit is not None):
+    if getattr(args_global, "johansen_bonus", False) and j_trace is not None and j_crit is not None:
         johansen_gap = max(0.0, float(j_trace) - float(j_crit))
-        pending_j_bonus = min(2.0, johansen_gap / 5.0)  # stronger pass => bigger bonus
+        pending_j_bonus = min(2.0, johansen_gap / 5.0)
 
-    # Compose notes
     notes_str = f"β={beta:.3f}; HL={primary.half_life:.1f}; Z={z:.2f}; p={primary.pvalue:.4f}; W={primary.window}"
     if notes:
         notes_str += "; " + "; ".join(notes)
 
-    # Regime and sizing already computed above: adf_p, stationary, vol_regime, spread_vol
-    # Suggested notional: risk dollars per 1 std spread move of daily change
-    suggested_notional = np.nan
-    realized_vol = np.nan
-    if account_equity is not None and pd.notna(spread_vol) and spread_vol > 0:
+    suggested_notional, realized_vol = np.nan, np.nan
+    if account_equity and pd.notna(spread_vol) and spread_vol > 0:
         risk_dollars = float(account_equity) * float(risk_unit)
         suggested_notional = risk_dollars / spread_vol
-        # Volatility-adjusted scaling for per-trade sizing
         if getattr(args_global, "target_vol", None):
             realized_vol = spread.pct_change().std()
             if pd.notna(realized_vol) and realized_vol > 0:
                 suggested_notional *= (args_global.target_vol / realized_vol)
-    # --- Conviction-based sizing adjust (uses adaptive-entry conviction 0–5) ---
-    if pd.notna(suggested_notional):
-        size_factor = max(0.5, min(1.5, (conviction or 0.0) / 5.0))  # clamp 0.5x–1.5x
-        suggested_notional *= size_factor
-        notes.append(f"SizeAdj×{size_factor:.2f} via conviction={conviction:.2f}")
+        if pd.notna(suggested_notional):
+            size_factor = max(0.5, min(1.5, (conviction or 0.0) / 5.0))
+            suggested_notional *= size_factor
 
-    # ---- Conviction upgrading: apply scaled Johansen bonus and volatility damping ----
-    # Use realized_vol on the best window for damping; if missing, compute now.
     try:
-        vol_for_conv = realized_vol if 'realized_vol' in locals() and pd.notna(realized_vol) else spread.pct_change().std()
+        vol_for_conv = realized_vol if pd.notna(realized_vol) else spread.pct_change().std()
+        vol_adj = max(0.5, 1.0 - min(0.5, float(vol_for_conv) / 0.05)) if pd.notna(vol_for_conv) and vol_for_conv > 0 else 1.0
     except Exception:
-        vol_for_conv = np.nan
+        vol_adj = 1.0
+    
+    cv_score = (cv_score + pending_j_bonus) * vol_adj
+    if cv_score >= 7.0: cv_band = "High"
+    elif cv_score >= 4.0: cv_band = "Medium"
+    else: cv_band = "Low"
 
-    # Damping: if vol ~5%/day or higher, reduce conviction down to as low as 0.5x
-    vol_adj = 1.0
-    if pd.notna(vol_for_conv) and vol_for_conv > 0:
-        vol_adj = max(0.5, 1.0 - min(0.5, float(vol_for_conv) / 0.05))
-
-    # Apply: (base score + scaled Johansen bonus) * volatility adjustment
-    cv_score = (cv_score + (pending_j_bonus if 'pending_j_bonus' in locals() else 0.0)) * vol_adj
-    # Recompute band after adjustment
-    if cv_score >= 7.0:
-        cv_band = "High"
-    elif cv_score >= 4.0:
-        cv_band = "Medium"
-    else:
-        cv_band = "Low"
-
-    # --- Johansen enrichment (reuse dynamic values) ---
-    johansen_trace = float(j_trace) if j_trace is not None else np.nan
-    johansen_crit = float(j_crit) if j_crit is not None else np.nan
-    johansen_pass = bool(j_pass)
-
-    # Flip and corr_drift_spy will be filled later in export loop
     exp_guide, opt_map, contracts = build_option_mapping(y, x, beta, primary.half_life, delta_atm, delta_ditm)
+    
     return PairResult(
         y, x, primary, secondary, cv_score, cv_band, signal, notes_str, action,
         exp_guide, opt_map, contracts,
         adf_p, stationary, vol_regime, spread_vol, suggested_notional,
-        johansen_trace, johansen_crit, johansen_pass, "", np.nan,
-        growth_phase=phase,
-        phase_guidance=guidance,
-        support_1σ=support_1,
-        resistance_1σ=resist_1,
-        support_2σ=support_2,
-        resistance_2σ=resist_2,
-        sr_signal=sr_signal,
+        float(j_trace) if j_trace is not None else np.nan,
+        float(j_crit) if j_crit is not None else np.nan,
+        bool(j_pass), "", np.nan,
+        phase, guidance,
+        s1, r1, s2, r2, sr_signal
     )
 
 
@@ -1267,11 +1187,6 @@ def log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=False):
             diag_df = pd.read_csv(diag_path)
             row["Flips"] = (diag_df["Flip"] == "Yes").sum() if "Flip" in diag_df.columns else 0
             row["AvgCorrDriftSPY"] = diag_df["CorrDriftSPY"].mean() if "CorrDriftSPY" in diag_df.columns else None
-            row["Support_1σ"] = r.support_1σ
-            row["Resistance_1σ"] = r.resistance_1σ
-            row["Support_2σ"] = r.support_2σ
-            row["Resistance_2σ"] = r.resistance_2σ
-            row["SR_Signal"] = r.sr_signal
         except Exception as e:
             msg = f"[StatArb] Failed to attach diagnostics summary: {e}"
             print(msg)
@@ -1293,10 +1208,10 @@ def compute_sr_levels(spread: pd.Series):
     sigma = spread.std()
     return {
         "MA": mu,
-        "Support_1σ": mu - sigma,
-        "Resistance_1σ": mu + sigma,
-        "Support_2σ": mu - 2*sigma,
-        "Resistance_2σ": mu + 2*sigma,
+        "Support_1s": mu - sigma,
+        "Resistance_1s": mu + sigma,
+        "Support_2s": mu - 2*sigma,
+        "Resistance_2s": mu + 2*sigma,
     }
 
 def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int, beta: float, run_dir: str):
@@ -1304,18 +1219,19 @@ def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int,
     Export spread and Z-score series for a given pair into CSV.
     """
     try:
-        spread = px[left] - beta * px[right]
+        sub = px[[left, right]].dropna().tail(window)
+        spread = sub[left] - beta * sub[right]
         z = zscore(spread)
-        mu = spread.mean()
-        sigma = spread.std()
+        sr = compute_sr_levels(spread)
+        
         df = pd.DataFrame({
-            "Spread": spread.tail(window),
-            "ZScore": z.tail(window),
-            "MA": mu,
-            "Support_1σ": mu - sigma,
-            "Resistance_1σ": mu + sigma,
-            "Support_2σ": mu - 2*sigma,
-            "Resistance_2σ": mu + 2*sigma
+            "Spread": spread,
+            "ZScore": z,
+            "MA": sr["MA"],
+            "Support_1s": sr["Support_1s"],
+            "Resistance_1s": sr["Resistance_1s"],
+            "Support_2s": sr["Support_2s"],
+            "Resistance_2s": sr["Resistance_2s"]
         })
         out_path = os.path.join(run_dir, f"{left}-{right}_spread_timeseries.csv")
         df.to_csv(out_path)
@@ -2014,39 +1930,28 @@ def main():
 
     # Export watchlist (top N)
     wl_rows = []
-    # (The rest of the main function is unchanged...)
     for r in results[:args.max_pairs]:
-        legweights = f"{r.left}: +1.00, {r.right}: -{r.best.beta:.2f}"
         wl_rows.append({
             "Pair": f"{r.left}-{r.right}",
             "Left": r.left,
             "Right": r.right,
-            "SR_Signal": r.sr_signal,
-            "BestWindow": r.best.window if pd.notna(r.best.window) else "",
-            "PValue": round(r.best.pvalue, 6) if pd.notna(r.best.pvalue) else "",
-            "Beta": round(r.best.beta, 4) if pd.notna(r.best.beta) else "",
-            "HalfLife": round(r.best.half_life, 2) if pd.notna(r.best.half_life) else "",
-            "Z": round(r.best.z_curr, 3) if pd.notna(r.best.z_curr) else "",
-            "Conviction": round(r.conviction_score, 2) if pd.notna(r.conviction_score) else "",
+            "BestWindow": r.best.window,
+            "PValue": f"{r.best.pvalue:.4f}",
+            "Beta": f"{r.best.beta:.3f}",
+            "HalfLife": f"{r.best.half_life:.1f}",
+            "Z": f"{r.best.z_curr:.2f}",
+            "Conviction": f"{r.conviction_score:.2f}",
             "ConvictionBand": r.conviction_band,
             "Signal": r.signal,
             "Action": r.action,
-            "Notes": r.notes,
-            "ExpirationGuide": r.expiration_guide,
-            "OptionMap": r.option_map,
-            "ContractsSummary": r.contracts_summary,
-            "StationarityP": round(r.stationarity_p, 4) if pd.notna(r.stationarity_p) else "",
-            "Stationary": r.stationary,
-            "VolRegime": r.vol_regime,
-            "SpreadVol": round(r.spread_vol, 5) if pd.notna(r.spread_vol) else "",
-            "SuggestedNotional": round(r.suggested_notional, 2) if pd.notna(r.suggested_notional) else "",
-            "JohansenTrace": round(r.johansen_trace, 3) if pd.notna(r.johansen_trace) else "",
-            "JohansenCrit": round(r.johansen_crit, 3) if pd.notna(r.johansen_crit) else "",
-            "JohansenPass": r.johansen_pass,
-            "Flip": r.flip,
-            "CorrDriftSPY": round(r.corr_drift_spy, 4) if pd.notna(r.corr_drift_spy) else "",
+            "SR_Signal": r.sr_signal,
+            "Support_1s": f"{r.support_1s:.2f}",
+            "Resistance_1s": f"{r.resistance_1s:.2f}",
+            "Support_2s": f"{r.support_2s:.2f}",
+            "Resistance_2s": f"{r.resistance_2s:.2f}",
             "GrowthPhase": r.growth_phase,
             "PhaseGuidance": r.phase_guidance,
+            "Notes": r.notes,
         })
 
     wl_df = pd.DataFrame(wl_rows)
