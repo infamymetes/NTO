@@ -281,6 +281,11 @@ class PairResult:
     # growth phase diagnostics
     growth_phase: str = ""
     phase_guidance: str = ""
+    support_1σ: float = np.nan
+    resistance_1σ: float = np.nan
+    support_2σ: float = np.nan
+    resistance_2σ: float = np.nan
+    sr_signal: str = ""
 
 # --- Portfolio Planner dataclasses ---
 @dataclass
@@ -773,7 +778,7 @@ def growth_phase(z_history: list[float], half_life: float, beta: float) -> tuple
     """
     Classify the regime of a pair into one of four growth-cycle phases.
     Inputs:
-      - z_history: rolling Z-score history
+      - z_history: rolling Z-score history (list/np.array/Series)
       - half_life: estimated reversion horizon
       - beta: sensitivity of spread
     Outputs:
@@ -781,12 +786,27 @@ def growth_phase(z_history: list[float], half_life: float, beta: float) -> tuple
       - guidance: textual advice for trading in that regime
     """
 
-    if not z_history or len(z_history) < 5:
+    # Normalize to 1-D numpy array and drop NaNs
+    try:
+        z_arr = np.asarray(z_history, dtype=float).ravel()
+    except Exception:
+        return "Unknown", "Invalid z-history"
+
+    z_arr = z_arr[~np.isnan(z_arr)]
+    if z_arr.size < 5:
         return "Unknown", "Insufficient history"
 
-    slope = np.polyfit(range(len(z_history)), z_history, 1)[0]
-    variance = np.var(z_history[-10:])  # recent spread variance
-    latest_z = z_history[-1]
+    # Guard against degenerate recent slice length
+    recent_n = min(10, z_arr.size)
+
+    # Compute slope via polyfit with basic error guard
+    try:
+        slope = float(np.polyfit(np.arange(z_arr.size), z_arr, 1)[0])
+    except Exception:
+        slope = 0.0
+
+    variance = float(np.var(z_arr[-recent_n:]))
+    latest_z = float(z_arr[-1])
 
     # Phase rules
     if slope > 0.2 and latest_z > 1 and half_life < 5:
@@ -843,6 +863,39 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
     sub = px[[y, x]].dropna().tail(primary.window)
     spread = sub[y] - beta * sub[x]
     z_history = zscore(spread).values
+    sr_levels = compute_sr_levels(spread)
+    support_1 = sr_levels["Support_1σ"]
+    resist_1 = sr_levels["Resistance_1σ"]
+    support_2 = sr_levels["Support_2σ"]
+    resist_2 = sr_levels["Resistance_2σ"]
+
+    notes = []
+    range_note = (
+    f"Spread={spread.iloc[-1]:.2f}; "
+    f"S1={support_1:.2f}; R1={resist_1:.2f}; "
+    f"S2={support_2:.2f}; R2={resist_2:.2f}"
+    )
+    notes.append(range_note)
+
+    # --- SR Signal Classification ---
+    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
+        sr_signal = "Beyond ±2σ"
+    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
+        sr_signal = "Beyond ±1σ"
+    else:
+        sr_signal = "Inside Band"
+
+    # Append SR signal into notes (for watchlist.csv)
+    notes.append(f"SR_Signal={sr_signal}")
+    notes.append(range_note)
+    
+    # --- SR Signal Classification ---
+    if spread.iloc[-1] > resist_2 or spread.iloc[-1] < support_2:
+        sr_signal = "Beyond ±2σ"
+    elif spread.iloc[-1] > resist_1 or spread.iloc[-1] < support_1:
+        sr_signal = "Beyond ±1σ"
+    else:
+        sr_signal = "Inside Band"
     # --- Growth phase diagnostics ---
     phase, guidance = growth_phase(z_history, primary.half_life, beta)
     # --- Regime + risk stats (computed before adaptive entry so we can use spread_vol/macro) ---
@@ -865,7 +918,6 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
         macro_flag=macro_flag
     )
 
-    notes = []
     action = ""
     # Use new adaptive entry rule for signal/action
     if signal != "HOLD" and conviction >= 2.5:
@@ -963,7 +1015,12 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
         adf_p, stationary, vol_regime, spread_vol, suggested_notional,
         johansen_trace, johansen_crit, johansen_pass, "", np.nan,
         growth_phase=phase,
-        phase_guidance=guidance
+        phase_guidance=guidance,
+        support_1σ=support_1,
+        resistance_1σ=resist_1,
+        support_2σ=support_2,
+        resistance_2σ=resist_2,
+        sr_signal=sr_signal,
     )
 
 
@@ -1210,6 +1267,11 @@ def log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=False):
             diag_df = pd.read_csv(diag_path)
             row["Flips"] = (diag_df["Flip"] == "Yes").sum() if "Flip" in diag_df.columns else 0
             row["AvgCorrDriftSPY"] = diag_df["CorrDriftSPY"].mean() if "CorrDriftSPY" in diag_df.columns else None
+            row["Support_1σ"] = r.support_1σ
+            row["Resistance_1σ"] = r.resistance_1σ
+            row["Support_2σ"] = r.support_2σ
+            row["Resistance_2σ"] = r.resistance_2σ
+            row["SR_Signal"] = r.sr_signal
         except Exception as e:
             msg = f"[StatArb] Failed to attach diagnostics summary: {e}"
             print(msg)
@@ -1226,6 +1288,17 @@ def log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=False):
 
 args_global = None
 
+def compute_sr_levels(spread: pd.Series):
+    mu = spread.mean()
+    sigma = spread.std()
+    return {
+        "MA": mu,
+        "Support_1σ": mu - sigma,
+        "Resistance_1σ": mu + sigma,
+        "Support_2σ": mu - 2*sigma,
+        "Resistance_2σ": mu + 2*sigma,
+    }
+
 def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int, beta: float, run_dir: str):
     """
     Export spread and Z-score series for a given pair into CSV.
@@ -1233,9 +1306,16 @@ def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int,
     try:
         spread = px[left] - beta * px[right]
         z = zscore(spread)
+        mu = spread.mean()
+        sigma = spread.std()
         df = pd.DataFrame({
             "Spread": spread.tail(window),
-            "ZScore": z.tail(window)
+            "ZScore": z.tail(window),
+            "MA": mu,
+            "Support_1σ": mu - sigma,
+            "Resistance_1σ": mu + sigma,
+            "Support_2σ": mu - 2*sigma,
+            "Resistance_2σ": mu + 2*sigma
         })
         out_path = os.path.join(run_dir, f"{left}-{right}_spread_timeseries.csv")
         df.to_csv(out_path)
@@ -1941,6 +2021,7 @@ def main():
             "Pair": f"{r.left}-{r.right}",
             "Left": r.left,
             "Right": r.right,
+            "SR_Signal": r.sr_signal,
             "BestWindow": r.best.window if pd.notna(r.best.window) else "",
             "PValue": round(r.best.pvalue, 6) if pd.notna(r.best.pvalue) else "",
             "Beta": round(r.best.beta, 4) if pd.notna(r.best.beta) else "",
