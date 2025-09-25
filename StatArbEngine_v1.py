@@ -1521,17 +1521,6 @@ def main():
     pair_mode = args.pair is not None
     args_global = args
 
-    # --- Ad-hoc analysis: override universe if --adhoc is set
-    if getattr(args, "adhoc", None):
-                adhoc_tickers = [str(t).upper() for t in args.adhoc]
-                if not args.universe:
-                    args.universe = []
-                before = set(args.universe)
-                args.universe = list(set(args.universe) | set(adhoc_tickers))
-                new_adds = sorted(set(args.universe) - before)
-                print(f"[StatArb] === Running Ad-hoc Analysis ===")
-                print(f"[StatArb] Added {len(new_adds)} tickers via adhoc: {new_adds}")
-
     # If requested, list available curated groups and exit early
     if getattr(args, "list_groups", False):
         try:
@@ -1607,6 +1596,7 @@ def main():
                     args.macro_event = str(cfg["name"])
         except Exception as e:
             print(f"[StatArb] Failed to load event config {args.event_config}: {e}")
+
     # Print preset banner line before any other output
     if args.preset_spy_scan:
         print("[StatArb] === Running with SPY Scan Preset ===")
@@ -1730,7 +1720,7 @@ def main():
         args.vix_sensitive = True
         args.universe = ["SPY", "VIXY", "TLT"]
         args.note = args.note or "Volatility probe preset (SPY/VIXY/TLT, 15m)"
-    print(f"[StatArb] Using VolProbe preset: {args.universe}, interval={args.interval}, windows={args.windows}")
+        print(f"[StatArb] Using VolProbe preset: {args.universe}, interval={args.interval}, windows={args.windows}")
 
     # --- Overnight Drift Preset ---
     if args.preset_overnight:
@@ -1739,7 +1729,7 @@ def main():
         args.start_offset_days = 5
         args.universe = ["SPY", "QQQ", "DIA"]
         args.note = args.note or "Overnight drift preset (SPY/QQQ/DIA, 30m, 5-day)"
-    print(f"[StatArb] Using Overnight preset: {args.universe}, start_offset_days={args.start_offset_days}, interval={args.interval}")
+        print(f"[StatArb] Using Overnight preset: {args.universe}, start_offset_days={args.start_offset_days}, interval={args.interval}")
 
     # --- Gamma Squeeze Preset ---
     if args.preset_gamma:
@@ -1748,7 +1738,7 @@ def main():
         args.universe = ["SPY", "QQQ", "TSLA", "NVDA", "AMZN"]
         args.johansen_triples = True
         args.note = args.note or "Gamma squeeze preset (TSLA/NVDA/AMZN, Johansen triples)"
-    print(f"[StatArb] Using Gamma preset: {args.universe}, interval={args.interval}, windows={args.windows}, Johansen=on")
+        print(f"[StatArb] Using Gamma preset: {args.universe}, interval={args.interval}, windows={args.windows}, Johansen=on")
 
     # --- Breadth Stress Test Preset ---
     if args.preset_breadth:
@@ -1757,44 +1747,7 @@ def main():
         args.universe = ["SPY", "QQQ", "RSP", "XLF", "XLK", "XLE", "XLV", "XLU", "XLY", "XLP"]
         args.market_internals_rollup = True
         args.note = args.note or "Breadth stress test preset (SPY vs RSP divergence, 1h)"
-    print(f"[StatArb] Using Breadth preset: {args.universe}, interval={args.interval}, windows={args.windows}, rollup enabled")
-
-    import glob
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join("./runs", run_ts)
-    px = None
-    resumed = False
-    if args.resume:
-        # Find most recent run directory with px_snapshot.csv
-        runs = sorted(
-            [d for d in glob.glob("./runs/*") if os.path.isdir(d)],
-            reverse=True
-        )
-        found = False
-        for d in runs:
-            px_snap = os.path.join(d, "px_snapshot.csv")
-            if os.path.exists(px_snap):
-                run_dir = d
-                try:
-                    px = pd.read_csv(px_snap, index_col=0, parse_dates=True)
-                    resumed = True
-                    found = True
-                    print(f"[StatArb] Resuming from previous run: {run_dir}")
-                    break
-                except Exception as e:
-                    print(f"[StatArb] Failed to load px_snapshot.csv from {d}: {e}")
-        if not found:
-            print("[StatArb] --resume set, but no previous run with px_snapshot.csv found. Creating new run.")
-            os.makedirs(run_dir, exist_ok=True)
-    else:
-        os.makedirs(run_dir, exist_ok=True)
-
-    # Override output paths to point into run_dir (output directory)
-    args.output = run_dir  # Add output attribute for clarity
-    args.watchlist = os.path.join(args.output, "watchlist.csv")
-    args.diagnostics = os.path.join(args.output, "diagnostics.csv")
-    if args.correlations is not None:
-        args.correlations = os.path.join(args.output, "correlations.csv")
+        print(f"[StatArb] Using Breadth preset: {args.universe}, interval={args.interval}, windows={args.windows}, rollup enabled")
 
     # --- Load universe from file if provided ---
     if args.universe_file and os.path.exists(args.universe_file):
@@ -1848,6 +1801,17 @@ def main():
         except Exception as e:
             print(f"[StatArb] Failed to load groups_file {args.groups_file}: {e}")
 
+    # --- Ad-hoc analysis: override universe (MOVED HERE TO RUN AFTER PRESETS) ---
+    if getattr(args, "adhoc", None):
+        adhoc_tickers = [str(t).upper() for t in args.adhoc]
+        if not args.universe:
+            args.universe = []
+        before = set(args.universe)
+        args.universe = list(set(args.universe) | set(adhoc_tickers))
+        new_adds = sorted(set(args.universe) - before)
+        print(f"[StatArb] === Running Ad-hoc Analysis ===")
+        print(f"[StatArb] Added {len(new_adds)} tickers via adhoc: {new_adds}")
+
     # Liquidity pruning and KNN setup
     score_map = read_liquidity_scores(args.liquidity_file)
     original_universe = args.universe
@@ -1870,6 +1834,33 @@ def main():
     if yf is None or coint is None or sm is None:
         raise SystemExit("Missing dependencies. Please install with: pip install yfinance statsmodels pandas numpy")
 
+    import glob
+    px = None
+    resumed = False
+    if args.resume:
+        # Find most recent run directory with px_snapshot.csv
+        runs = sorted(
+            [d for d in glob.glob("./runs/*") if os.path.isdir(d)],
+            reverse=True
+        )
+        found = False
+        for d in runs:
+            px_snap = os.path.join(d, "px_snapshot.csv")
+            if os.path.exists(px_snap):
+                # Use the existing run_dir from the resumed session
+                run_dir = d
+                try:
+                    px = pd.read_csv(px_snap, index_col=0, parse_dates=True)
+                    resumed = True
+                    found = True
+                    print(f"[StatArb] Resuming from previous run: {run_dir}")
+                    break
+                except Exception as e:
+                    print(f"[StatArb] Failed to load px_snapshot.csv from {d}: {e}")
+        if not found:
+            print("[StatArb] --resume set, but no previous run with px_snapshot.csv found. Creating new run.")
+            # run_dir is already initialized at the top, so no need to re-create it.
+    
     if not resumed:
         print("[StatArb] Loading prices...")
         if args.source == "local":
@@ -1894,6 +1885,14 @@ def main():
     else:
         # Already loaded px from px_snapshot.csv
         print(f"[StatArb] Universe: {list(px.columns)}; Rows: {len(px)}")
+
+    # Override output paths to point into run_dir (output directory)
+    args.output = run_dir  # Add output attribute for clarity
+    args.watchlist = os.path.join(args.output, "watchlist.csv")
+    args.diagnostics = os.path.join(args.output, "diagnostics.csv")
+    if args.correlations is not None:
+        args.correlations = os.path.join(args.output, "correlations.csv")
+
 
     # Optional Johansen diagnostics for triples
     if args.johansen_triples:
@@ -2227,5 +2226,3 @@ if args.rank_by in key_map:
 
 if __name__ == "__main__":
     main()
-
-  
