@@ -1,3 +1,5 @@
 RunID,RunDir,Timestamp,MacroEvent,Preset,HLBand,Z_enter,BetaMode,RiskUnit,PairsFound,Signals,HighConviction,MediumConviction,JohansenPasses,TotalNotional,SectorUsage,CircuitBreaker,Note,Flips,AvgCorrDriftSPY
 9a8f06b7,./runs/20250925_142658,2025-09-25 14:26:59,,,3-40,2.0,ols,0.01,1,HOLD,0,0,0,0,{},False,WTD hourly scan,0,
 d67ee7ab,./runs/20250925_143300,2025-09-25 14:33:01,,,3-40,2.0,ols,0.01,1,HOLD,0,0,0,0,{},False,WTD hourly scan,0,
+4dfe88c4,./runs/20250925_151545,2025-09-25 15:15:46,,,3-60,1.5,ols,0.01,1,HOLD,0,0,0,0,{},False,"Intraday probe preset (5m, windows=30/60/90)",0,
+90cf6359,./runs/20250925_151552,2025-09-25 15:15:58,,Macro Scan,3-60,1.5,ols,0.01,61,"ENTER_LONG,ENTER_SHORT,HOLD",0,0,21,0,{},False,,0,

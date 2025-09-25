@@ -82,10 +82,28 @@ def log_error(run_dir: str, msg: str):
     except Exception:
         pass
 
+# --------------------------- Sector and Group Maps ---------------------------
 SECTOR_MAP = {
     "XLK": "Tech", "XLF": "Financials", "XLE": "Energy", "XLV": "Healthcare",
     "XLY": "ConsumerDisc", "XLP": "ConsumerStap", "XLU": "Utilities",
     "XLI": "Industrials", "XLB": "Materials", "SPY": "Broad", "QQQ": "Broad", "IWM": "Broad", "DIA": "Broad"
+}
+# Curated groups for quick universe expansion (approx. top 20 by weight/liquidity)
+GROUPS = {
+    "SPY20": [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","AVGO","BRK-B","LLY",
+        "JNJ","JPM","XOM","UNH","V","PG","MA","COST","HD","CVX"
+    ],
+    "NDAQ20": [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","AVGO","TSLA","COST","PEP",
+        "AMD","NFLX","ADBE","CSCO","QCOM","INTC","TXN","AMAT","INTU","BKNG"
+    ],
+    "MEGACAP10": [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","BRK-B","LLY"
+    ],
+    "SEMIS10": [
+        "NVDA","AVGO","AMD","TSM","QCOM","INTC","TXN","AMAT","ASML","LRCX"
+    ]
 }
 # --- Johansen pairs global set ---
 johansen_pairs = set()
@@ -697,15 +715,23 @@ def build_universe(args):
                     "TLT","IEF","SHY","KRE","XHB","GLD","UUP","VIXY"]
     elif getattr(args, "preset_alpha_scan", False) and not universe:
         universe = ["SPY", "QQQ", "IWM"]
+    elif getattr(args, "preset_intraday_probe", False) and not universe:
+        universe = ["SPY","QQQ","IWM","DIA"]
+    elif getattr(args, "preset_wtd", False) and not universe:
+        universe = ["SPY","QQQ","RSP","XLK","XLF","XLE","XLV"]
     # Always deduplicate and uppercase
     universe = list({t.upper() for t in universe})
-    # If event config provided a universe, that should take precedence (already handled in main)
-    # Optionally enforce special rules (anchors always present)
-    anchors = {"SPY", "QQQ"}
+    # Always enforce anchors
+    anchors = {"SPY","QQQ"}
     for a in anchors:
-        if a in args.universe and a not in universe:
+        if a not in universe:
             universe.append(a)
-    # Return as sorted list for consistency
+ 
+    # Optionally prune for liquidity if requested
+    if getattr(args, "min_liquidity", None) is not None:
+        score_map = read_liquidity_scores(getattr(args, "liquidity_file", None))
+        universe = apply_liquidity_filter(universe, args.min_liquidity, score_map)
+ 
     return sorted(universe)
 
 def build_knn_pairs(px: pd.DataFrame, anchors: list, k: int) -> set:
@@ -1354,6 +1380,12 @@ def main():
     import os
     import json
     ap = argparse.ArgumentParser(description="StatArb Engine v1.3 — pairs scanner")
+    ap.add_argument("--debug_universe", action="store_true",
+                    help="Print debug information about universe construction and filtering.")
+    ap.add_argument("--rank_by", type=str, choices=["conviction","half_life","johansen","expectancy"], default=None,
+                    help="Sort results by chosen metric before exporting (conviction, half_life, johansen, expectancy).")
+    ap.add_argument("--adhoc", nargs="+", metavar=("TICKER"), default=None,
+                    help="Run ad-hoc analysis on a list of tickers (bypasses presets).")
     
     # --- ADDED: start_offset_days argument ---
     ap.add_argument("--start_offset_days", type=int, default=None,
@@ -1398,6 +1430,12 @@ def main():
                     help="Optional macro event tag (e.g., FOMC, CPI, Jobs) for run labeling")
     ap.add_argument("--universe", nargs='+', required=False, default=[],
                     help="Ticker universe (optional if using a preset)")
+    ap.add_argument("--groups", nargs="+", default=None,
+                    help="One or more curated bundles to include in the universe (e.g., SPY20 NDAQ20).")
+    ap.add_argument("--list_groups", action="store_true",
+                    help="List available GROUPS bundles and exit.")
+    ap.add_argument("--groups_file", type=str, default=None,
+                    help="Path to CSV/JSON file defining custom groups for universe expansion.")
     ap.add_argument("--start", type=str, default="2021-01-01")
     ap.add_argument("--preset", type=str, choices=["YTD","1Y"], default=None,
                     help="Date presets: YTD = from Jan 1 of current year; 1Y = 1 year back from today")
@@ -1468,10 +1506,66 @@ def main():
                     help="CSV file with tickers (column: ticker). Merged with --universe")
     ap.add_argument("--johansen_topn", type=int, default=20,
                     help="Limit number of correlated names vs anchor for Johansen triples")
+    ap.add_argument("--preset_wtd", action="store_true",
+                help="Run week-to-date 1h scan preset")
+    ap.add_argument("--preset_volprobe", action="store_true",
+    help="Run volatility probe preset (15m interval, SPY/VIXY/TLT, windows=15/45/90, VIX-sensitive).")
+    ap.add_argument("--preset_overnight", action="store_true",
+    help="Run overnight drift preset (30m interval, SPY/QQQ proxies, 5-day lookback).")
+    ap.add_argument("--preset_gamma", action="store_true",
+    help="Run gamma squeeze preset (5m interval, TSLA/NVDA/etc, Johansen triples).")
+    ap.add_argument("--preset_breadth", action="store_true",
+    help="Run breadth stress test (1h interval, SPY vs RSP divergence with sector rollup).")
     args = ap.parse_args()
     global args_global
     pair_mode = args.pair is not None
     args_global = args
+
+    # --- Ad-hoc analysis: override universe if --adhoc is set
+    if getattr(args, "adhoc", None):
+                adhoc_tickers = [str(t).upper() for t in args.adhoc]
+                if not args.universe:
+                    args.universe = []
+                before = set(args.universe)
+                args.universe = list(set(args.universe) | set(adhoc_tickers))
+                new_adds = sorted(set(args.universe) - before)
+                print(f"[StatArb] === Running Ad-hoc Analysis ===")
+                print(f"[StatArb] Added {len(new_adds)} tickers via adhoc: {new_adds}")
+
+    # If requested, list available curated groups and exit early
+    if getattr(args, "list_groups", False):
+        try:
+            names = sorted(GROUPS.keys())
+            print("[StatArb] Available groups:")
+            for name in names:
+                tickers = GROUPS.get(name, [])
+                preview = ", ".join(tickers[:10]) + (" ..." if len(tickers) > 10 else "")
+                print(f"  - {name} ({len(tickers)}): {preview}")
+        except Exception as e:
+            print(f"[StatArb] Failed to list groups: {e}")
+            # --- Extension: print external groups from groups_file if present
+            if getattr(args, "groups_file", None) and os.path.exists(args.groups_file):
+                try:
+                    ext_groups = {}
+                    if args.groups_file.lower().endswith(".json"):
+                        with open(args.groups_file, "r") as gf:
+                            ext_groups = _json.load(gf)
+                    else:
+                        import pandas as pd
+                        df = pd.read_csv(args.groups_file)
+                        for _, row in df.iterrows():
+                            g = str(row.get("group","")).upper()
+                            t = str(row.get("ticker","")).upper()
+                            if g and t:
+                                ext_groups.setdefault(g, []).append(t)
+                    if ext_groups:
+                        print("[StatArb] External groups from file:")
+                        for name, tickers in ext_groups.items():
+                            preview = ", ".join(tickers[:10]) + (" ..." if len(tickers) > 10 else "")
+                            print(f"  - {name} ({len(tickers)}): {preview}")
+                except Exception as e:
+                    print(f"[StatArb] Failed to list external groups from {args.groups_file}: {e}")
+        return
 
     # Setup run_dir early so it's available before use
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1629,6 +1723,42 @@ def main():
         except Exception as e:
             print(f"[StatArb] Failed to fetch VIX for sensitivity scaling: {e}")
 
+    # --- Volatility Probe Preset ---
+    if args.preset_volprobe:
+        args.interval = "15m"
+        args.windows = [15, 45, 90]
+        args.vix_sensitive = True
+        args.universe = ["SPY", "VIXY", "TLT"]
+        args.note = args.note or "Volatility probe preset (SPY/VIXY/TLT, 15m)"
+    print(f"[StatArb] Using VolProbe preset: {args.universe}, interval={args.interval}, windows={args.windows}")
+
+    # --- Overnight Drift Preset ---
+    if args.preset_overnight:
+        args.interval = "30m"
+        args.windows = [30, 60, 120]
+        args.start_offset_days = 5
+        args.universe = ["SPY", "QQQ", "DIA"]
+        args.note = args.note or "Overnight drift preset (SPY/QQQ/DIA, 30m, 5-day)"
+    print(f"[StatArb] Using Overnight preset: {args.universe}, start_offset_days={args.start_offset_days}, interval={args.interval}")
+
+    # --- Gamma Squeeze Preset ---
+    if args.preset_gamma:
+        args.interval = "5m"
+        args.windows = [15, 30, 60]
+        args.universe = ["SPY", "QQQ", "TSLA", "NVDA", "AMZN"]
+        args.johansen_triples = True
+        args.note = args.note or "Gamma squeeze preset (TSLA/NVDA/AMZN, Johansen triples)"
+    print(f"[StatArb] Using Gamma preset: {args.universe}, interval={args.interval}, windows={args.windows}, Johansen=on")
+
+    # --- Breadth Stress Test Preset ---
+    if args.preset_breadth:
+        args.interval = "1h"
+        args.windows = [60, 120, 252]
+        args.universe = ["SPY", "QQQ", "RSP", "XLF", "XLK", "XLE", "XLV", "XLU", "XLY", "XLP"]
+        args.market_internals_rollup = True
+        args.note = args.note or "Breadth stress test preset (SPY vs RSP divergence, 1h)"
+    print(f"[StatArb] Using Breadth preset: {args.universe}, interval={args.interval}, windows={args.windows}, rollup enabled")
+
     import glob
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join("./runs", run_ts)
@@ -1678,6 +1808,46 @@ def main():
             print(msg)
             log_error(run_dir, msg)
 
+    # --- Expand universe from curated groups (SPY20, NDAQ20, etc.) ---
+    if getattr(args, "groups", None):
+        added = []
+        for g in args.groups:
+            key = str(g).upper()
+            if key in GROUPS:
+                added.extend(GROUPS[key])
+            else:
+                print(f"[Warn] Unknown group '{g}'. Available: {list(GROUPS.keys())}")
+        if added:
+            before = set(args.universe)
+            args.universe = list({*(t.upper() for t in (args.universe or [])), *added})
+            new_adds = sorted(set(args.universe) - before)
+            print(f"[StatArb] Groups added {len(new_adds)} tickers via {args.groups}: {new_adds[:10]}{' ...' if len(new_adds) > 10 else ''}")
+
+    # --- Expand universe from external groups file ---
+    if getattr(args, "groups_file", None) and os.path.exists(args.groups_file):
+        try:
+            if args.groups_file.lower().endswith(".json"):
+                with open(args.groups_file, "r") as gf:
+                    group_data = _json.load(gf)
+            else:
+                import pandas as pd
+                df = pd.read_csv(args.groups_file)
+                group_data = {}
+                for _, row in df.iterrows():
+                    group = str(row.get("group", "")).upper()
+                    tick = str(row.get("ticker", "")).upper()
+                    if group and tick:
+                        group_data.setdefault(group, []).append(tick)
+            if isinstance(group_data, dict):
+                for g, tickers in group_data.items():
+                    before = set(args.universe)
+                    args.universe = list(set(args.universe) | set(tickers))
+                    new_adds = sorted(set(args.universe) - before)
+                    if new_adds:
+                        print(f"[StatArb] Groups_file added {len(new_adds)} tickers via {g}: {new_adds[:10]}{' ...' if len(new_adds) > 10 else ''}")
+        except Exception as e:
+            print(f"[StatArb] Failed to load groups_file {args.groups_file}: {e}")
+
     # Liquidity pruning and KNN setup
     score_map = read_liquidity_scores(args.liquidity_file)
     original_universe = args.universe
@@ -1692,6 +1862,9 @@ def main():
 
     # --- Universe build step (after liquidity filter, before loading prices) ---
     args.universe = build_universe(args)
+    # Debug print for universe after construction and filtering
+    if getattr(args, "debug_universe", False):
+        print(f"[Debug] Final universe ({len(args.universe)}): {sorted(args.universe)}")
 
     # Basic checks
     if yf is None or coint is None or sm is None:
@@ -2041,7 +2214,18 @@ def main():
         update_equity_curve(run_dir)
         update_performance_metrics(run_dir)
 
+if 'results_sorted' in locals() and args.rank_by:
+    key_map = {
+        "conviction": lambda r: getattr(r, "conviction_score", 0),
+        "half_life": lambda r: getattr(r, "best", None) and getattr(r.best, "half_life", 0) or 0,
+        "johansen": lambda r: getattr(r, "johansen_strength", 0),
+        "expectancy": lambda r: getattr(r, "expectancy", 0),
+    }
+if args.rank_by in key_map:
+        results_sorted = sorted(results_sorted, key=key_map[args.rank_by], reverse=True)
+        print(f"[StatArb] Results ranked by {args.rank_by}")
 
 if __name__ == "__main__":
     main()
 
+  
