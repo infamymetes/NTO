@@ -1927,7 +1927,6 @@ def main():
 
     # Export watchlist (top N)
     wl_rows = []
-    # (The rest of the main function is unchanged...)
     for r in results[:args.max_pairs]:
         wl_rows.append({
             "Pair": f"{r.left}-{r.right}",
@@ -1964,7 +1963,7 @@ def main():
         else:
             print("[MarketInternals] Watchlist is empty, skipping rollup.")
 
-# Export diagnostics (all results)
+    # Export diagnostics (all results)
     diags_rows = []
     for r in results:
         diags_rows.append({
@@ -1980,13 +1979,6 @@ def main():
             "ConvictionBand": r.conviction_band,
             "Signal": r.signal,
             "Action": r.action,
-            "SR_Signal": r.sr_signal,
-            "Support_1s": r.support_1s,
-            "Resistance_1s": r.resistance_1s,
-            "Support_2s": r.support_2s,
-            "Resistance_2s": r.resistance_2s,
-            "GrowthPhase": r.growth_phase,
-            "PhaseGuidance": r.phase_guidance,
             "Notes": r.notes,
             "StationarityP": r.stationarity_p,
             "Stationary": r.stationary,
@@ -1995,7 +1987,14 @@ def main():
             "SuggestedNotional": r.suggested_notional,
             "JohansenTrace": r.johansen_trace,
             "JohansenCrit": r.johansen_crit,
-            "JohansenPass": r.johansen_pass
+            "JohansenPass": r.johansen_pass,
+            "GrowthPhase": r.growth_phase,
+            "PhaseGuidance": r.phase_guidance,
+            "SR_Signal": r.sr_signal,
+            "Support_1s": r.support_1s,
+            "Resistance_1s": r.resistance_1s,
+            "Support_2s": r.support_2s,
+            "Resistance_2s": r.resistance_2s
         })
 
     diags_df = pd.DataFrame(diags_rows)
@@ -2010,5 +2009,7 @@ def main():
         log_pnl(run_dir, results, args.account_equity)
         update_equity_curve(run_dir)
         update_performance_metrics(run_dir)
+
+
 if __name__ == "__main__":
     main()
