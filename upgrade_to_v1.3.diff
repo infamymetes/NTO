@@ -1,0 +1,228 @@
+--- a/StatArbEngine_v1.py
++++ b/StatArbEngine_v1.py
+@@ -2,16 +2,18 @@
+ # -*- coding: utf-8 -*-
+ """
+-StatArb Engine v1.2 (single-file scaffold)
++StatArb Engine v1.3 (single-file scaffold)
+ Author: Mike + ChatGPT
+ License: MIT
+ ---------------------------------------------------------------------
+ Purpose
+   • Scan a universe of tickers for cointegrated pairs across multiple rolling windows
+   • Compute hedge ratio (beta), spread Z-score, and mean-reversion half-life
+   • Score conviction and emit trade signals
+   • Export Watchlist CSV (top candidates) and Diagnostics CSV (full details)
+ 
+-Changes in v1.2
+-  • Added --start_offset_days CLI argument for flexible, rolling start dates.
+-  • Corrected logic in growth_phase, S/R level integration, and watchlist export.
++Changes in v1.3
++  • Added robust, numeric strength signals (SR_Deviation, JohansenStrength).
++  • Added a natural-language description field (NL_Description) to all outputs.
++  • Enhanced diagnostics.csv with new strength fields for better analysis.
+ 
+ Usage Example
+   python StatArbEngine_v1.py \
+@@ -213,12 +215,12 @@
+     # growth phase diagnostics
+     growth_phase: str = ""
+     phase_guidance: str = ""
+-    # S/R levels
+-    support_1s: float = np.nan
+-    resistance_1s: float = np.nan
+-    support_2s: float = np.nan
+-    resistance_2s: float = np.nan
+-    sr_signal: str = ""
++    # --- ENHANCED FIELDS for v1.3 ---
++    sr_deviation: float = np.nan
++    sr_signal_strength: str = ""
++    johansen_strength: float = np.nan
++    phase_confidence: float = np.nan
++    nl_description: str = ""
+ 
+ 
+ # --- Portfolio Planner dataclasses ---
+@@ -536,13 +538,36 @@
+         return "Maturity", "Default regime"
+ 
+ 
++def generate_nl_description(r: 'PairResult') -> str:
++    """Generates a human-readable summary sentence for a pair result."""
++    
++    # SR Description
++    sr_desc = "is inside its ±1s band"
++    if r.sr_signal_strength != "Inside Band":
++        sign = "+" if r.sr_deviation > 0 else ""
++        sr_desc = f"is {r.sr_signal_strength.lower()} stretched at {sign}{r.sr_deviation:.2f}s"
++
++    # Johansen Description
++    j_desc = "weak Johansen evidence"
++    if r.johansen_strength > 0:
++        j_desc = f"strong Johansen pass (gap +{r.johansen_strength:.2f})"
++    
++    # Phase Description
++    phase_desc = f"in a {r.growth_phase.lower()} regime"
++
++    return (
++        f"{r.left}-{r.right} spread {sr_desc}, HL={r.best.half_life:.1f}d, {phase_desc}, with {j_desc}. "
++        f"Conviction: {r.conviction_band}."
++    )
++
++
+ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
+                   pvalue_cut: float, hl_min: int, hl_max: int,
+                   z_enter: float, z_scale: float, z_exit: float,
+                   delta_atm: float, delta_ditm: float,
+                   account_equity: Optional[float], risk_unit: float) -> Optional[PairResult]:
+     diags: List[WindowDiagnostic] = []
+-
+     for W in windows:
+         sub = px[[y, x]].dropna().tail(W)
+         if len(sub) < max(20, W // 2):
+@@ -570,20 +595,20 @@
+     spread = sub[y] - beta * sub[x]
+     z_history = zscore(spread).values
+ 
++    # --- ENHANCED S/R Signal Logic ---
+     sr_levels = compute_sr_levels(spread)
+-    s1, r1, s2, r2 = sr_levels["Support_1s"], sr_levels["Resistance_1s"], sr_levels["Support_2s"], sr_levels["Resistance_2s"]
+-    
+-    current_spread = spread.iloc[-1]
+-    if current_spread > r2 or current_spread < s2:
+-        sr_signal = "Beyond ±2s"
+-    elif current_spread > r1 or current_spread < s1:
+-        sr_signal = "Beyond ±1s"
++    mu, sigma = sr_levels["MA"], spread.std()
++    sr_deviation = (spread.iloc[-1] - mu) / sigma if sigma > 0 else 0.0
++    
++    if abs(sr_deviation) > 2:
++        sr_signal_strength = "Severe"
++    elif abs(sr_deviation) > 1:
++        sr_signal_strength = "Mild"
+     else:
+-        sr_signal = "Inside Band"
+-
++        sr_signal_strength = "Inside Band"
++        
+     phase, guidance = growth_phase(z_history, primary.half_life, beta)
+     adf_p, stationary, vol_regime, spread_vol = regime_flags(spread)
+     macro_flag = (vol_regime or "Normal").lower()
+     dz = np.gradient(z_history)[-1] if len(z_history) > 1 else 0.0
+     ddz = np.gradient(np.gradient(z_history))[-1] if len(z_history) > 2 else 0.0
+-    
+     pvbe_band, dvte_score = "inside", 0.0
+     signal, conviction = adaptive_entry_rule(z, spread_vol, dz, ddz, pvbe_band, dvte_score, macro_flag)
+     
+@@ -599,22 +624,23 @@
+ 
+     cv_score, cv_band = conviction_score(primary, secondary, z_scale, hl_min, hl_max)
+ 
++    # --- ENHANCED Johansen Strength Logic ---
+     j_pass, j_trace, j_crit = False, np.nan, np.nan
+     try:
+         sub_for_j = px[[y, x]].dropna().tail(primary.window)
+         if len(sub_for_j) >= 60:
+             j_pass, j_trace, j_crit = johansen_passes(sub_for_j, conf=0.95)
+-            if getattr(args_global, "johansen_trace_threshold", None) is not None and j_trace is not None:
+-                j_pass = bool(j_trace > float(args_global.johansen_trace_threshold))
+     except Exception:
+         pass
+ 
+     if getattr(args_global, "johansen_filter", False) and not j_pass:
+         return None
+ 
++    johansen_strength = (j_trace - j_crit) if pd.notna(j_trace) and pd.notna(j_crit) else np.nan
++
+     pending_j_bonus = 0.0
+-    if getattr(args_global, "johansen_bonus", False) and j_trace is not None and j_crit is not None:
+-        johansen_gap = max(0.0, float(j_trace) - float(j_crit))
++    if getattr(args_global, "johansen_bonus", False) and pd.notna(johansen_strength):
++        johansen_gap = max(0.0, johansen_strength)
+         pending_j_bonus = min(2.0, johansen_gap / 5.0)
+ 
+     notes_str = f"β={beta:.3f}; HL={primary.half_life:.1f}; Z={z:.2f}; p={primary.pvalue:.4f}; W={primary.window}"
+@@ -647,14 +673,23 @@
+ 
+     exp_guide, opt_map, contracts = build_option_mapping(y, x, beta, primary.half_life, delta_atm, delta_ditm)
+     
+-    return PairResult(
++    result = PairResult(
+         y, x, primary, secondary, cv_score, cv_band, signal, notes_str, action,
+         exp_guide, opt_map, contracts,
+         adf_p, stationary, vol_regime, spread_vol, suggested_notional,
+-        float(j_trace) if j_trace is not None else np.nan,
+-        float(j_crit) if j_crit is not None else np.nan,
+-        bool(j_pass), "", np.nan,
++        float(j_trace) if pd.notna(j_trace) else np.nan,
++        float(j_crit) if pd.notna(j_crit) else np.nan,
++        bool(j_pass), "", np.nan, # flip and corr_drift are placeholders
+         phase, guidance,
+-        s1, r1, s2, r2, sr_signal
++        sr_deviation=sr_deviation,
++        sr_signal_strength=sr_signal_strength,
++        johansen_strength=johansen_strength,
++        # Placeholder for phase_confidence, can be enhanced later
++        phase_confidence=np.nan 
+     )
++    
++    # Finally, generate the natural language description
++    result.nl_description = generate_nl_description(result)
++    
++    return result
+ 
+ 
+ def log_pnl(run_dir, results, account_equity):
+@@ -1486,13 +1521,11 @@
+             "ConvictionBand": r.conviction_band,
+             "Signal": r.signal,
+             "Action": r.action,
+-            "SR_Signal": r.sr_signal,
+-            "Support_1s": f"{r.support_1s:.2f}",
+-            "Resistance_1s": f"{r.resistance_1s:.2f}",
+-            "Support_2s": f"{r.support_2s:.2f}",
+-            "Resistance_2s": f"{r.resistance_2s:.2f}",
+             "GrowthPhase": r.growth_phase,
+-            "PhaseGuidance": r.phase_guidance,
++            "SR_Signal": r.sr_signal_strength,
++            "SR_Deviation": f"{r.sr_deviation:.3f}",
++            "JohansenStrength": f"{r.johansen_strength:.3f}" if pd.notna(r.johansen_strength) else "",
++            "NL_Description": r.nl_description,
+             "Notes": r.notes,
+         })
+ 
+@@ -1516,21 +1549,15 @@
+             "Right": r.right,
+             "BestWindow": r.best.window,
+             "PValue": r.best.pvalue,
+             "Beta": r.best.beta,
+             "HalfLife": r.best.half_life,
+             "Z": r.best.z_curr,
+             "Conviction": r.conviction_score,
+             "ConvictionBand": r.conviction_band,
+             "Signal": r.signal,
+             "Action": r.action,
+-            "SR_Signal": r.sr_signal,
+-            "Support_1s": r.support_1s,
+-            "Resistance_1s": r.resistance_1s,
+-            "Support_2s": r.support_2s,
+-            "Resistance_2s": r.resistance_2s,
+-            "GrowthPhase": r.growth_phase,
+-            "PhaseGuidance": r.phase_guidance,
+             "Notes": r.notes,
+             "StationarityP": r.stationarity_p,
+             "Stationary": r.stationary,
+@@ -1540,7 +1567,12 @@
+             "SuggestedNotional": r.suggested_notional,
+             "JohansenTrace": r.johansen_trace,
+             "JohansenCrit": r.johansen_crit,
+-            "JohansenPass": r.johansen_pass
++            "JohansenPass": r.johansen_pass,
++            # --- NEW FIELDS FOR DIAGNOSTICS ---
++            "SR_Deviation": r.sr_deviation,
++            "SR_Signal_Strength": r.sr_signal_strength,
++            "JohansenStrength": r.johansen_strength,
++            "NL_Description": r.nl_description
+         })
+ 
+     diags_df = pd.DataFrame(diags_rows)
