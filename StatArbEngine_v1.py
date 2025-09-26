@@ -47,12 +47,12 @@ INTERVAL_FALLBACK = {
 # Diagnostics logs for data fetch behavior
 FALLBACK_LOG = []   # list of dicts: {"from": interval, "to": fallback, "start": start, "tickers": len(tickers)}
 CLAMP_LOG = []      # list of dicts: {"interval": interval, "from": str(start), "to": str(min_start)}
-def clamp_start_for_interval(interval: str, start_date) -> pd.Timestamp:
+def clamp_start_for_interval(interval: str, start_date, respect_explicit: bool = False) -> pd.Timestamp:
     """
     Clamp start_date based on Yahoo Finance interval constraints.
     1m/2m: last 7 days only.
     5m/15m/30m/60m/1h: last 60 days.
-    Else: unchanged.
+    If respect_explicit is True, only log a warning if out of bounds, do not clamp.
     """
     now = datetime.utcnow()
     if start_date.tzinfo is not None:
@@ -62,14 +62,22 @@ def clamp_start_for_interval(interval: str, start_date) -> pd.Timestamp:
         limit = now - timedelta(days=7)
         if start_date < limit:
             CLAMP_LOG.append({"interval": interval, "from": str(start_date), "to": str(limit)})
-            print(f"[Warn] interval={interval} requires start not older than 7 days. Clamping from {start_date} to {limit}")
-            return pd.Timestamp(limit)
+            if respect_explicit:
+                print(f"[Warn] interval={interval} requires start not older than 7 days. Requested start {start_date} is too old, but not clamped due to explicit end date.")
+                return start_date
+            else:
+                print(f"[Warn] interval={interval} requires start not older than 7 days. Clamping from {start_date} to {limit}")
+                return pd.Timestamp(limit)
     elif interval in ["5m", "15m", "30m", "60m", "1h"]:
         limit = now - timedelta(days=60)
         if start_date < limit:
             CLAMP_LOG.append({"interval": interval, "from": str(start_date), "to": str(limit)})
-            print(f"[Warn] interval={interval} requires start not older than 60 days. Clamping from {start_date} to {limit}")
-            return pd.Timestamp(limit)
+            if respect_explicit:
+                print(f"[Warn] interval={interval} requires start not older than 60 days. Requested start {start_date} is too old, but not clamped due to explicit end date.")
+                return start_date
+            else:
+                print(f"[Warn] interval={interval} requires start not older than 60 days. Clamping from {start_date} to {limit}")
+                return pd.Timestamp(limit)
     return start_date
 
 
@@ -434,8 +442,8 @@ def ensure_cache_dir():
 def cache_path(t: str) -> str:
     return os.path.join(DATA_CACHE_DIR, f"{t.upper()}.parquet")
 
-def fetch_yf_single(ticker: str, start: str, interval: str) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, interval=interval, progress=False, auto_adjust=False)
+def fetch_yf_single(ticker: str, start: str, interval: str, end: Optional[str] = None) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=False)
     s = df["Adj Close"] if "Adj Close" in df.columns else df["Close"]
     s = s.dropna()
     s.name = ticker.upper()
@@ -447,7 +455,7 @@ def fetch_yf_single(ticker: str, start: str, interval: str) -> pd.DataFrame:
     else:
         raise TypeError(f"Unexpected type from yfinance: {type(s)}")
 
-def load_prices_cached_yf(tickers: List[str], start: str, interval: str, refresh: bool=False) -> pd.DataFrame:
+def load_prices_cached_yf(tickers: List[str], start: str, interval: str, refresh: bool=False, end: Optional[str] = None) -> pd.DataFrame:
     ensure_cache_dir()
     frames = []
     for t in tickers:
@@ -462,13 +470,13 @@ def load_prices_cached_yf(tickers: List[str], start: str, interval: str, refresh
         if cached is not None and not cached.empty:
             last_dt = cached.index.max()
             try:
-                tail = fetch_yf_single(tU, (last_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), interval)
+                tail = fetch_yf_single(tU, (last_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), interval, end=end)
                 merged = pd.concat([cached, tail], axis=0)
                 merged = merged[~merged.index.duplicated(keep='last')]
             except Exception:
                 merged = cached
         else:
-            merged = fetch_yf_single(tU, start, interval)
+            merged = fetch_yf_single(tU, start, interval, end=end)
         try:
             merged.sort_index(inplace=True)
             merged.to_parquet(cp)
@@ -491,20 +499,46 @@ def load_prices_cached_yf(tickers: List[str], start: str, interval: str, refresh
     raise ValueError(f"[Error] No data returned for tickers at interval={interval}, start={start}. No fallback available.")
 
 def load_prices(tickers: List[str], start: str, interval: str,
-                source: str = "yfinance", use_cache: bool = True, refresh: bool = False) -> pd.DataFrame:
+                source: str = "yfinance", use_cache: bool = True, refresh: bool = False, end: Optional[str] = None) -> pd.DataFrame:
     if source == "local":
         raise RuntimeError("Use load_prices_local() for local source")
     if yf is None:
         raise RuntimeError("yfinance not installed. Please `pip install yfinance statsmodels`")
+    # Determine if explicit end date is provided, for clamp logic
+    respect_explicit = end is not None
     # Clamp start for intraday intervals
     if interval in ["1m","2m","5m","15m","30m","60m","1h"]:
-        start = clamp_start_for_interval(interval, pd.to_datetime(start))
+        start = clamp_start_for_interval(interval, pd.to_datetime(start), respect_explicit=respect_explicit)
     if use_cache:
-        df = load_prices_cached_yf(tickers, start, interval, refresh=refresh)
+        df = load_prices_cached_yf(tickers, start, interval, refresh=refresh, end=end)
     else:
-        frames = [fetch_yf_single(t, start, interval) for t in tickers]
+        frames = [fetch_yf_single(t, start, interval, end=end) for t in tickers]
         df = pd.concat(frames, axis=1)
+    # After fetching, adjust rolling windows based on available data
+    if args_global is not None and hasattr(args_global, "windows"):
+        df_rows = df.shape[0]
+        orig_windows = list(args_global.windows)
+        adj_windows = adjust_windows_for_data(orig_windows, df_rows)
+        if adj_windows != orig_windows:
+            print(f"[StatArb] Adjusted rolling windows for data length {df_rows}: {orig_windows} -> {adj_windows}")
+            args_global.windows = adj_windows
     return df.dropna(how="all")
+
+# --- Helper to adjust rolling windows based on available data ---
+def adjust_windows_for_data(windows: list, num_rows: int):
+    """
+    Returns a list of windows, removing any that are larger than half the available rows.
+    If all would be removed, keeps at least the smallest original window.
+    """
+    if not windows or num_rows <= 0:
+        return windows
+    safe_max = max(1, num_rows // 2)
+    trimmed = [w for w in windows if w <= safe_max]
+    if not trimmed:
+        # All were too large; keep the smallest original window
+        min_win = min(windows)
+        return [min_win]
+    return trimmed
 
 def load_prices_local(tickers: List[str], local_dir: str) -> pd.DataFrame:
     """Load price data from local CSV files in a directory.
@@ -1466,6 +1500,8 @@ def main():
     ap.add_argument("--max_pairs", type=int, default=8, help="Top pairs to export in watchlist")
     ap.add_argument("--watchlist", type=str, default="./outputs/watchlist_pairs.csv")
     ap.add_argument("--diagnostics", type=str, default="./outputs/diagnostics.csv")
+    ap.add_argument("--freshness_report", type=str, default=None,
+                help="Optional: path to write freshness summary report (symbols × completeness).")
     ap.add_argument("--local_dir", type=str, default=None, help="Local directory with CSV files for price data")
     ap.add_argument("--delta_atm", type=float, default=0.5, help="Assumed ATM option delta for contract mapping")
     ap.add_argument("--delta_ditm", type=float, default=0.9, help="Assumed Deep ITM option delta for contract mapping")
@@ -1513,17 +1549,42 @@ def main():
     ap.add_argument("--preset_wtd", action="store_true",
                 help="Run week-to-date 1h scan preset")
     ap.add_argument("--preset_volprobe", action="store_true",
-    help="Run volatility probe preset (15m interval, SPY/VIXY/TLT, windows=15/45/90, VIX-sensitive).")
+        help="Run volatility probe preset (15m interval, SPY/VIXY/TLT, windows=15/45/90, VIX-sensitive).")
     ap.add_argument("--preset_overnight", action="store_true",
-    help="Run overnight drift preset (30m interval, SPY/QQQ proxies, 5-day lookback).")
+        help="Run overnight drift preset (30m interval, SPY/QQQ proxies, 5-day lookback).")
     ap.add_argument("--preset_gamma", action="store_true",
-    help="Run gamma squeeze preset (5m interval, TSLA/NVDA/etc, Johansen triples).")
+        help="Run gamma squeeze preset (5m interval, TSLA/NVDA/etc, Johansen triples).")
     ap.add_argument("--preset_breadth", action="store_true",
-    help="Run breadth stress test (1h interval, SPY vs RSP divergence with sector rollup).")
+        help="Run breadth stress test (1h interval, SPY vs RSP divergence with sector rollup).")
+    ap.add_argument("--symbols", nargs="+", default=None,
+                help="Explicit list of tickers (overrides --universe and presets).")
+    ap.add_argument("--freq", type=str, default=None,
+                help="Data frequency / interval (e.g. 1d, 1h, 5m).")
+    ap.add_argument("--end", type=str, default=None,
+                help="Explicit end date (YYYY-MM-DD).")
+    
     args = ap.parse_args()
     global args_global
     pair_mode = args.pair is not None
     args_global = args
+
+    # Override universe if explicit symbols provided
+    if args.symbols:
+        args.universe = [s.upper() for s in args.symbols]
+        print(f"[StatArb] Using explicit symbols: {args.universe}")
+
+    # Override interval if freq provided
+    if args.freq:
+        args.interval = args.freq
+        print(f"[StatArb] Using frequency: {args.interval}")
+
+    # Show start/end dates
+    if args.start:
+        print(f"[StatArb] Start date: {args.start}")
+    if args.end:
+        print(f"[StatArb] End date: {args.end}")
+
+
 
     # If requested, list available curated groups and exit early
     if getattr(args, "list_groups", False):
@@ -2215,6 +2276,28 @@ def main():
     ensure_dir(args.diagnostics)
     diags_df.to_csv(args.diagnostics, index=False)
     print(f"[StatArb] Diagnostics saved: {os.path.abspath(args.diagnostics)}")
+
+    # --- Freshness Summary Report ---
+    if args.freshness_report:
+        try:
+            if os.path.exists(args.diagnostics):
+                diag_df = pd.read_csv(args.diagnostics)
+                if not diag_df.empty and "RowsObserved" in diag_df.columns and "RowsExpected" in diag_df.columns:
+                    # Compute completeness %
+                    diag_df["CompletenessPct"] = (
+                        diag_df["RowsObserved"] / diag_df["RowsExpected"]
+                    ) * 100.0
+                    summary = diag_df[["Left", "Right", "RowsObserved", "RowsExpected", "CompletenessPct"]]
+                    summary.to_csv(args.freshness_report, index=False)
+                    print(f"[Freshness] Report saved to {os.path.abspath(args.freshness_report)}")
+                else:
+                    print("[Freshness] Diagnostics CSV missing required columns (RowsObserved/RowsExpected). Skipping report.")
+            else:
+                print(f"[Freshness] Diagnostics file not found: {args.diagnostics}")
+        except Exception as e:
+            msg = f"[Freshness] Failed to create freshness report: {e}"
+            print(msg)
+            log_error(run_dir, msg)
 
     # --- Final Logging and Metrics Update ---
     log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=tripped)

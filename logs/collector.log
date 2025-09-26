@@ -1,0 +1,5 @@
+2025-09-26 13:54:57.509 | INFO     | __main__:run_collector:63 - [Collector] Pulling SPY 1d 2024-01-01→2024-06-01
+2025-09-26 13:55:47.271 | INFO     | __main__:run_collector:66 - [Collector] Pulling SPY 1d 2024-01-01→2024-06-01
+2025-09-26 13:58:07.339 | INFO     | __main__:run_collector:66 - [Collector] Pulling SPY 1d 2024-01-01→2024-06-01
+2025-09-26 13:58:08.788 | INFO     | __main__:run_collector:66 - [Collector] Pulling QQQ 1d 2024-01-01→2024-06-01
+2025-09-26 13:58:10.734 | INFO     | __main__:run_collector:66 - [Collector] Pulling RSP 1d 2024-01-01→2024-06-01

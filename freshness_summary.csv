@@ -1,0 +1,3 @@
+symbol,freq,start,end,expected,covered,missing,completeness
+SPY,1d,2025-01-01,2025-09-26,193,153,193,0.0
+QQQ,1d,2025-01-01,2025-09-26,193,153,193,0.0
