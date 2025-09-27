@@ -1,0 +1,222 @@
+diff a/StatArbEngine_v1.py b/StatArbEngine_v1.py	(rejected hunks)
+@@ -302,6 +302,9 @@ class PairResult:
+     johansen_strength: float = np.nan
+     phase_confidence: float = np.nan
+     nl_description: str = ""
++    rows_observed: int = 0
++    rows_expected: int = 0
++    pair_completeness: float = np.nan
+ 
+ 
+ # --- Portfolio Planner dataclasses ---
+@@ -656,7 +659,7 @@ def save_position_plans(run_dir: str, plans: List[PositionPlan]):
+         return
+     import csv, os
+     path = os.path.join("./runs", "positions.csv")
+-    os.makedirs("./runs", exist_ok=True)
++    ensure_dir(path)
+     write_header = not os.path.exists(path)
+     with open(path, "a", newline="") as f:
+         w = csv.writer(f)
+@@ -718,10 +721,11 @@ def save_units_watchlist(run_dir: str, csp_plans: List[UnitPlan], cc_plans: List
+         rows.append([run_dir, ts, p.kind, p.underlying, p.dte_min, p.dte_max, p.delta, p.target_shares, p.note])
+     if not rows:
+         return
+-    os.makedirs("./runs", exist_ok=True)
+     path = os.path.join("./runs", "units_watchlist.csv")
++    ensure_dir(path)
+     write_header = not os.path.exists(path)
+     with open(path, "a", newline="") as f:
++
+         w = csv.writer(f)
+         if write_header:
+             w.writerow(["RunDir","Timestamp","Kind","Underlying","DTE_Min","DTE_Max","Delta","TargetShares","Note"])
+@@ -894,13 +898,28 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
+     diags: List[WindowDiagnostic] = []
+     for W in windows:
+         sub = px[[y, x]].dropna().tail(W)
++
++        rows_observed = len(sub)
++        rows_expected = W
++        pair_completeness = rows_observed / rows_expected if rows_expected > 0 else np.nan
++
++        # Skip if pair completeness below threshold
++        if args_global is not None and args_global.min_completeness is not None:
++            if not np.isnan(pair_completeness) and pair_completeness < args_global.min_completeness:
++                continue
++
+         if len(sub) < max(20, W // 2):
+             continue
++
+         try:
+             pv = engle_granger_pvalue(sub[y], sub[x])
+             if pv >= pvalue_cut:
+                 continue
+-            beta = ols_beta(sub[y], sub[x]) if getattr(args_global, "beta_mode", "ols") == "ols" else rls_kalman_beta(sub[y], sub[x])
++            beta = (
++                ols_beta(sub[y], sub[x])
++                if getattr(args_global, "beta_mode", "ols") == "ols"
++                else rls_kalman_beta(sub[y], sub[x])
++            )
+             if pd.isna(beta):
+                 return None
+             spread = sub[y] - beta * sub[x]
+@@ -1017,7 +1036,10 @@ def evaluate_pair(px: pd.DataFrame, y: str, x: str, windows: List[int],
+         sr_signal_strength=sr_signal_strength,
+         johansen_strength=johansen_strength,
+         # Placeholder for phase_confidence, can be enhanced later
+-        phase_confidence=np.nan 
++        phase_confidence=np.nan,
++        rows_observed=rows_observed,
++        rows_expected=rows_expected,
++        pair_completeness=pair_completeness
+     )
+     
+     # Finally, generate the natural language description
+@@ -1053,10 +1075,12 @@ def log_pnl(run_dir, results, account_equity):
+     try:
+         df = pd.DataFrame(rows)
+         exists = os.path.isfile(pnl_hist_path)
++        ensure_dir(pnl_hist_path)
+         if not exists:
+             df.to_csv(pnl_hist_path, index=False, mode="w")
+         else:
+             df.to_csv(pnl_hist_path, index=False, mode="a", header=False)
++
+     except Exception as e:
+         msg = f"[StatArb] Failed to log PnL: {e}"
+         print(msg)
+@@ -1124,10 +1148,13 @@ def update_performance_metrics(run_dir):
+         }
+ 
+         # Save single-run snapshot
++        ensure_dir(perf_path)
+         pd.DataFrame([perf]).to_csv(perf_path, index=False)
+ 
++
+         # Append to performance history
+         mode = "a" if os.path.exists(hist_path) else "w"
++        ensure_dir(hist_path)
+         pd.DataFrame([perf]).to_csv(hist_path, mode=mode, header=(mode=="w"), index=False)
+ 
+         # Rolling Sharpe/Sortino (30 trades)
+@@ -1147,8 +1174,10 @@ def update_performance_metrics(run_dir):
+                 "RollingSortino": sortino_sub
+             })
+         if rolling:
++            ensure_dir(rolling_path)
+             pd.DataFrame(rolling).to_csv(rolling_path, index=False)
+ 
++
+     except Exception as e:
+         msg = f"[StatArb] Failed to update performance metrics: {e}"
+         print(msg)
+@@ -1171,6 +1200,7 @@ def update_equity_curve(run_dir):
+         pnl_df["EquityEnd"] = base_equity + pnl_df["CumPnL"]
+         pnl_df["Date"] = pd.to_datetime("today")
+         eq_df = pnl_df[["Date","EquityEnd"]]
++        ensure_dir(eq_path)
+         eq_df.to_csv(eq_path, index=False)
+     except Exception as e:
+         msg = f"[StatArb] Failed to update equity curve: {e}"
+@@ -1276,6 +1306,7 @@ def log_run_ledger(run_dir, args, results, sector_usage, circuit_breaker=False):
+     try:
+         df = pd.DataFrame([row])
+         exists = os.path.isfile(ledger_path)
++        ensure_dir(ledger_path)
+         df.to_csv(ledger_path, mode="a", header=not exists, index=False)
+         print(f"[StatArb] Run ledger updated: {os.path.abspath(ledger_path)}")
+     except Exception as e:
+@@ -1316,6 +1347,7 @@ def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int,
+             "Resistance_2s": sr["Resistance_2s"]
+         })
+         out_path = os.path.join(run_dir, f"{left}-{right}_spread_timeseries.csv")
++        ensure_dir(out_path)
+         df.to_csv(out_path)
+         return out_path
+     except Exception as e:
+@@ -1399,6 +1431,7 @@ def market_internals_rollup(watchlist_df: pd.DataFrame, run_dir: str):
+     
+     # Save to file
+     output_path = os.path.join(run_dir, "market_internals_rollup.csv")
++    ensure_dir(output_path)
+     result_df.to_csv(output_path, index=False)
+     print(f"[MarketInternals] Rollup saved to: {output_path}")
+     print(result_df.to_markdown(index=False))
+@@ -1408,7 +1441,6 @@ def market_internals_rollup(watchlist_df: pd.DataFrame, run_dir: str):
+ # --- END: MARKET INTERNALS ROLLUP
+ # ---------------------------------------------------------------------------------
+ 
+-
+ def main():
+     print("--- SCRIPT STARTED ---") # <--- ADD THIS LINE
+ 
+@@ -1502,6 +1534,8 @@ def main():
+     ap.add_argument("--diagnostics", type=str, default="./outputs/diagnostics.csv")
+     ap.add_argument("--freshness_report", type=str, default=None,
+                 help="Optional: path to write freshness summary report (symbols × completeness).")
++    ap.add_argument("--min_completeness", type=float, default=0.8,
++                help="Minimum completeness required (0.0–1.0). Skip symbols/pairs below this threshold.")
+     ap.add_argument("--local_dir", type=str, default=None, help="Local directory with CSV files for price data")
+     ap.add_argument("--delta_atm", type=float, default=0.5, help="Assumed ATM option delta for contract mapping")
+     ap.add_argument("--delta_ditm", type=float, default=0.9, help="Assumed Deep ITM option delta for contract mapping")
+@@ -1894,6 +1928,29 @@ def main():
+     # Debug print for universe after construction and filtering
+     if getattr(args, "debug_universe", False):
+         print(f"[Debug] Final universe ({len(args.universe)}): {sorted(args.universe)}")
++    
++    # --- Freshness completeness filter ---
++    if args.min_completeness is not None and args.freshness_report:
++        try:
++            if os.path.exists(args.freshness_report):
++                fr_df = pd.read_csv(args.freshness_report)
++                if not fr_df.empty and "completeness" in fr_df.columns and "symbol" in fr_df.columns:
++                    valid_syms = fr_df.loc[
++                        fr_df["completeness"] >= args.min_completeness, "symbol"
++                    ].str.upper().tolist()
++                    before = set(args.universe)
++                    args.universe = [s for s in args.universe if s.upper() in valid_syms]
++                    removed = sorted(before - set(args.universe))
++                    if removed:
++                        print(
++                            f"[StatArb] Dropped {len(removed)} symbols below completeness {args.min_completeness}: "
++                            f"{removed[:10]}{' ...' if len(removed) > 10 else ''}"
++                        )
++                    if not args.universe:
++                        print("[StatArb] WARN: Universe empty after applying freshness filter. Exiting.")
++                        return
++        except Exception as e:
++            print(f"[StatArb] Freshness filter failed: {e}")
+ 
+     # Basic checks
+     if yf is None or coint is None or sm is None:
+@@ -2269,7 +2326,10 @@ def main():
+             "SR_Deviation": r.sr_deviation,
+             "SR_Signal_Strength": r.sr_signal_strength,
+             "JohansenStrength": r.johansen_strength,
+-            "NL_Description": r.nl_description
++            "NL_Description": r.nl_description,
++            "RowsObserved": r.rows_observed,
++            "RowsExpected": r.rows_expected,
++            "PairCompleteness": r.pair_completeness,
+         })
+ 
+     diags_df = pd.DataFrame(diags_rows)
+@@ -2283,11 +2343,16 @@ def main():
+             if os.path.exists(args.diagnostics):
+                 diag_df = pd.read_csv(args.diagnostics)
+                 if not diag_df.empty and "RowsObserved" in diag_df.columns and "RowsExpected" in diag_df.columns:
+-                    # Compute completeness %
+                     diag_df["CompletenessPct"] = (
+                         diag_df["RowsObserved"] / diag_df["RowsExpected"]
+                     ) * 100.0
+                     summary = diag_df[["Left", "Right", "RowsObserved", "RowsExpected", "CompletenessPct"]]
++                    
++                    # Ensure parent directory exists
++                    dirpath = os.path.dirname(args.freshness_report)
++                    if dirpath:
++                        ensure_dir(dirpath)
++
+                     summary.to_csv(args.freshness_report, index=False)
+                     print(f"[Freshness] Report saved to {os.path.abspath(args.freshness_report)}")
+                 else:
