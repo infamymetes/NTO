@@ -1327,6 +1327,35 @@ def compute_sr_levels(spread: pd.Series):
         "Resistance_2s": mu + 2*sigma,
     }
 
+# ---------------- Freshness Report Helper ----------------
+def write_freshness_report(px: pd.DataFrame, run_dir: str, path: str):
+    """
+    Compute completeness by ticker (observed rows / max rows).
+    Save summary CSV to outputs.
+    """
+    try:
+        if px is None or px.empty:
+            return
+        max_rows = px.shape[0]
+        rows = []
+        for col in px.columns:
+            observed = px[col].count()
+            completeness = observed / max_rows if max_rows > 0 else 0.0
+            rows.append({
+                "Symbol": col,
+                "RowsObserved": observed,
+                "RowsExpected": max_rows,
+                "Completeness": round(completeness, 3)
+            })
+        df = pd.DataFrame(rows)
+        ensure_dir(path)
+        df.to_csv(path, index=False)
+        print(f"[Freshness] Report saved to {os.path.abspath(path)} with {len(df)} symbols")
+    except Exception as e:
+        msg = f"[Freshness] Failed to create freshness report: {e}"
+        print(msg)
+        log_error(run_dir, msg)
+
 def export_pair_timeseries(px: pd.DataFrame, left: str, right: str, window: int, beta: float, run_dir: str):
     """
     Export spread and Z-score series for a given pair into CSV.
@@ -1536,6 +1565,8 @@ def main():
                 help="Optional: path to write freshness summary report (symbols × completeness).")
     ap.add_argument("--min_completeness", type=float, default=0.8,
                 help="Minimum completeness required (0.0–1.0). Skip symbols/pairs below this threshold.")
+    ap.add_argument("--min_pair_completeness", type=float, default=None,
+                help="Drop pairs where average completeness falls below this threshold")
     ap.add_argument("--local_dir", type=str, default=None, help="Local directory with CSV files for price data")
     ap.add_argument("--delta_atm", type=float, default=0.5, help="Assumed ATM option delta for contract mapping")
     ap.add_argument("--delta_ditm", type=float, default=0.9, help="Assumed Deep ITM option delta for contract mapping")
@@ -1598,6 +1629,12 @@ def main():
                 help="Explicit end date (YYYY-MM-DD).")
     
     args = ap.parse_args()
+    # --- Default freshness report if not provided ---
+    if not args.freshness_report:
+        default_freshness = "./outputs/freshness_summary.csv"
+        if os.path.exists(default_freshness):
+            args.freshness_report = default_freshness
+            print(f"[StatArb] Using default freshness report: {default_freshness}")
     global args_global
     pair_mode = args.pair is not None
     args_global = args
@@ -1606,6 +1643,33 @@ def main():
     if args.symbols:
         args.universe = [s.upper() for s in args.symbols]
         print(f"[StatArb] Using explicit symbols: {args.universe}")
+
+        # --- Freshness completeness filter ---
+    if args.min_completeness is not None and args.freshness_report:
+        try:
+            if os.path.exists(args.freshness_report):
+                fr_df = pd.read_csv(args.freshness_report)
+                if not fr_df.empty and "Completeness" in fr_df.columns and "Symbol" in fr_df.columns:
+                    valid_syms = fr_df.loc[
+                        fr_df["Completeness"] >= args.min_completeness, "Symbol"
+                    ].str.upper().tolist()
+                    before = set(args.universe)
+                    args.universe = [s for s in args.universe if s.upper() in valid_syms]
+                    removed = sorted(before - set(args.universe))
+                    if removed:
+                        print(
+                            f"[StatArb] Dropped {len(removed)} symbols below Completeness {args.min_completeness}: "
+                            f"{removed[:10]}{' ...' if len(removed) > 10 else ''}"
+                        )
+                    if not args.universe:
+                        print("[StatArb] WARN: Universe empty after applying freshness filter. Exiting.")
+                        return
+                else:
+                    print("[Freshness] Report missing required columns. Skipping merge into diagnostics.")
+            else:
+                print(f"[Freshness] Freshness file not found: {args.freshness_report}")
+        except Exception as e:
+            print(f"[Freshness] Freshness filter failed: {e}")
 
     # Override interval if freq provided
     if args.freq:
@@ -2333,9 +2397,44 @@ def main():
         })
 
     diags_df = pd.DataFrame(diags_rows)
-    ensure_dir(args.diagnostics)
-    diags_df.to_csv(args.diagnostics, index=False)
-    print(f"[StatArb] Diagnostics saved: {os.path.abspath(args.diagnostics)}")
+
+    # --- Merge completeness into diagnostics ---
+    if args.freshness_report and os.path.exists(args.freshness_report):
+        try:
+            fr_df = pd.read_csv(args.freshness_report)
+            if not fr_df.empty and "symbol" in fr_df.columns and "completeness" in fr_df.columns:
+                # Map symbol -> completeness
+                comp_map = dict(zip(fr_df["symbol"].str.upper(), fr_df["completeness"]))
+                # Add completeness columns for Left and Right
+                diags_df["LeftCompleteness"] = diags_df["Left"].str.upper().map(comp_map)
+                diags_df["RightCompleteness"] = diags_df["Right"].str.upper().map(comp_map)
+                # Add pair-level average completeness
+                diags_df["PairCompleteness"] = diags_df[
+                    ["LeftCompleteness", "RightCompleteness"]
+                ].mean(axis=1)
+            else:
+                print("[Freshness] Report missing required columns. Skipping merge into diagnostics.")
+        except Exception as e:
+            print(f"[Freshness] Could not merge completeness into diagnostics: {e}")
+
+    # --- Apply min_pair_completeness filter ---
+    if args.min_pair_completeness is not None and "PairCompleteness" in diags_df.columns:
+        # Filter diagnostics
+        before_diags = len(diags_df)
+        diags_df = diags_df[diags_df["PairCompleteness"] >= args.min_pair_completeness]
+        after_diags = len(diags_df)
+        dropped_diags = before_diags - after_diags
+        if dropped_diags > 0:
+            print(f"[StatArb] Dropped {dropped_diags} pairs below PairCompleteness {args.min_pair_completeness} (diagnostics)")
+
+        # Filter results (for watchlist consistency)
+        valid_pairs = set(diags_df["Pair"].tolist())
+        before_results = len(results)
+        results = [r for r in results if f"{r.left}-{r.right}" in valid_pairs]
+        after_results = len(results)
+        dropped_results = before_results - after_results
+        if dropped_results > 0:
+            print(f"[StatArb] Dropped {dropped_results} pairs from watchlist due to PairCompleteness filter")
 
     # --- Freshness Summary Report ---
     if args.freshness_report:
@@ -2352,6 +2451,11 @@ def main():
                     dirpath = os.path.dirname(args.freshness_report)
                     if dirpath:
                         ensure_dir(dirpath)
+
+                    # Make sure the directory exists before saving
+                    out_dir = os.path.dirname(args.freshness_report)
+                    if out_dir:
+                        os.makedirs(out_dir, exist_ok=True)
 
                     summary.to_csv(args.freshness_report, index=False)
                     print(f"[Freshness] Report saved to {os.path.abspath(args.freshness_report)}")

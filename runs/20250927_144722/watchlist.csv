@@ -1,0 +1,3 @@
+Pair,Left,Right,BestWindow,PValue,Beta,HalfLife,Z,Conviction,ConvictionBand,Signal,Action,SR_Signal,SR_Deviation,JohansenStrength,NL_Description,Notes
+RSP-SPY,RSP,SPY,180,0.0120,0.201,4.1,-1.25,2.27,Low,HOLD,HOLD,Mild,-1.245,1.495,"RSP-SPY spread is mild stretched at -1.25s, HL=4.1d, in a maturity regime, with strong Johansen pass (gap +1.49). Conviction: Low.",β=0.201; HL=4.1; Z=-1.25; p=0.0120; W=180
+QQQ-RSP,QQQ,RSP,180,0.0190,5.269,4.5,1.13,2.16,Low,HOLD,HOLD,Mild,1.131,4.817,"QQQ-RSP spread is mild stretched at +1.13s, HL=4.5d, in a maturity regime, with strong Johansen pass (gap +4.82). Conviction: Low.",β=5.269; HL=4.5; Z=1.13; p=0.0190; W=180
