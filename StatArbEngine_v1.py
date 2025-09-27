@@ -1644,32 +1644,7 @@ def main():
         args.universe = [s.upper() for s in args.symbols]
         print(f"[StatArb] Using explicit symbols: {args.universe}")
 
-        # --- Freshness completeness filter ---
-    if args.min_completeness is not None and args.freshness_report:
-        try:
-            if os.path.exists(args.freshness_report):
-                fr_df = pd.read_csv(args.freshness_report)
-                if not fr_df.empty and "Completeness" in fr_df.columns and "Symbol" in fr_df.columns:
-                    valid_syms = fr_df.loc[
-                        fr_df["Completeness"] >= args.min_completeness, "Symbol"
-                    ].str.upper().tolist()
-                    before = set(args.universe)
-                    args.universe = [s for s in args.universe if s.upper() in valid_syms]
-                    removed = sorted(before - set(args.universe))
-                    if removed:
-                        print(
-                            f"[StatArb] Dropped {len(removed)} symbols below Completeness {args.min_completeness}: "
-                            f"{removed[:10]}{' ...' if len(removed) > 10 else ''}"
-                        )
-                    if not args.universe:
-                        print("[StatArb] WARN: Universe empty after applying freshness filter. Exiting.")
-                        return
-                else:
-                    print("[Freshness] Report missing required columns. Skipping merge into diagnostics.")
-            else:
-                print(f"[Freshness] Freshness file not found: {args.freshness_report}")
-        except Exception as e:
-            print(f"[Freshness] Freshness filter failed: {e}")
+    # (Redundant freshness completeness filter block removed)
 
     # Override interval if freq provided
     if args.freq:
@@ -1998,21 +1973,25 @@ def main():
         try:
             if os.path.exists(args.freshness_report):
                 fr_df = pd.read_csv(args.freshness_report)
-                if not fr_df.empty and "completeness" in fr_df.columns and "symbol" in fr_df.columns:
+                if not fr_df.empty and "Completeness" in fr_df.columns and "Symbol" in fr_df.columns:
                     valid_syms = fr_df.loc[
-                        fr_df["completeness"] >= args.min_completeness, "symbol"
+                        fr_df["Completeness"] >= args.min_completeness, "Symbol"
                     ].str.upper().tolist()
                     before = set(args.universe)
                     args.universe = [s for s in args.universe if s.upper() in valid_syms]
                     removed = sorted(before - set(args.universe))
                     if removed:
                         print(
-                            f"[StatArb] Dropped {len(removed)} symbols below completeness {args.min_completeness}: "
+                            f"[StatArb] Dropped {len(removed)} symbols below Completeness {args.min_completeness}: "
                             f"{removed[:10]}{' ...' if len(removed) > 10 else ''}"
                         )
                     if not args.universe:
                         print("[StatArb] WARN: Universe empty after applying freshness filter. Exiting.")
                         return
+                else:
+                    print("[Freshness] Report missing required columns. Skipping merge into diagnostics.")
+            else:
+                print(f"[Freshness] Freshness file not found: {args.freshness_report}")
         except Exception as e:
             print(f"[StatArb] Freshness filter failed: {e}")
 
@@ -2360,8 +2339,9 @@ def main():
             print("[MarketInternals] Watchlist is empty, skipping rollup.")
 
     # Export diagnostics (all results)
-    diags_rows = []
+    diags_rows = [] # <--- ADD THIS LINE BACK
     for r in results:
+    # --- Corrected Diagnostics Block ---
         diags_rows.append({
             "Pair": f"{r.left}-{r.right}",
             "Left": r.left,
@@ -2376,7 +2356,7 @@ def main():
             "Signal": r.signal,
             "Action": r.action,
             "Notes": r.notes,
-            "StationarityP": r.stationarity_p,
+            "stationarity_p": r.stationarity_p,
             "Stationary": r.stationary,
             "VolRegime": r.vol_regime,
             "SpreadVol": r.spread_vol,
@@ -2386,16 +2366,11 @@ def main():
             "JohansenPass": r.johansen_pass,
             "GrowthPhase": r.growth_phase,
             "PhaseGuidance": r.phase_guidance,
-            # --- NEW FIELDS FOR DIAGNOSTICS ---
             "SR_Deviation": r.sr_deviation,
             "SR_Signal_Strength": r.sr_signal_strength,
             "JohansenStrength": r.johansen_strength,
-            "NL_Description": r.nl_description,
-            "RowsObserved": r.rows_observed,
-            "RowsExpected": r.rows_expected,
-            "PairCompleteness": r.pair_completeness,
+            "NL_Description": r.nl_description
         })
-
     diags_df = pd.DataFrame(diags_rows)
 
     # --- Merge completeness into diagnostics ---
